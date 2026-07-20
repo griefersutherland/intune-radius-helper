@@ -1,0 +1,59 @@
+{
+  "_comment": "Copy this file, mount it at POLICY_RULES_FILE (default /config/policy.json), and edit. Rules are evaluated in order, first match wins; falling off the end uses defaultTier. 'when' conditions: {\"field\":..,\"op\":..,\"value\":..} with op in eq/neq/gt/gte/lt/lte/in/exists, combined with {\"all\":[...]}/{\"any\":[...]}/{\"not\":...}. See README.md for the full fact reference (compliance_state, device_found, last_sync_age_hours, device_account_enabled, user_found, user_account_enabled, cert_type, device_id_present_in_cert, user_upn_present_in_cert). This file reproduces the built-in default ruleset used when POLICY_RULES_FILE is absent.",
+  "version": 1,
+  "defaultTier": "reject",
+  "rules": [
+    {
+      "name": "user-cert-missing-device-pairing",
+      "when": {
+        "all": [
+          {"field": "cert_type", "op": "eq", "value": "user"},
+          {"field": "device_id_present_in_cert", "op": "eq", "value": false}
+        ]
+      },
+      "tier": "reject",
+      "reason": "user certificate missing required entra-device-id URN"
+    },
+    {
+      "name": "user-cert-unresolved",
+      "when": {
+        "all": [
+          {"field": "user_upn_present_in_cert", "op": "eq", "value": true},
+          {"field": "user_found", "op": "eq", "value": false}
+        ]
+      },
+      "tier": "reject",
+      "reason": "user certificate identity could not be resolved against Entra"
+    },
+    {
+      "name": "disabled-user-reject",
+      "when": {"field": "user_account_enabled", "op": "eq", "value": false},
+      "tier": "reject",
+      "reason": "user account disabled"
+    },
+    {
+      "name": "disabled-device-reject",
+      "when": {"field": "device_account_enabled", "op": "eq", "value": false},
+      "tier": "reject",
+      "reason": "device account disabled"
+    },
+    {
+      "name": "compliant-device-access",
+      "when": {
+        "all": [
+          {"field": "device_found", "op": "eq", "value": true},
+          {"field": "compliance_state", "op": "eq", "value": "compliant"},
+          {"field": "last_sync_age_hours", "op": "lte", "value": 72}
+        ]
+      },
+      "tier": "access",
+      "reason": "device compliant"
+    },
+    {
+      "name": "known-noncompliant-device-untrust",
+      "when": {"field": "device_found", "op": "eq", "value": true},
+      "tier": "untrust",
+      "reason": "device enrolled but not compliant"
+    }
+  ]
+}

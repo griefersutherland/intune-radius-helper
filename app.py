@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sqlite3
+import ssl
 import subprocess
 import tempfile
 import time
@@ -30,6 +31,7 @@ from urllib.parse import quote
 
 import asyncpg
 import httpx
+import ldap3
 import redis.asyncio as redis
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -58,15 +60,24 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 
 URN_PREFIX = os.getenv("URN_PREFIX", "urn:t0.pac3.net").rstrip(":")
 
-REQUIRE_COMPLIANT = env_bool("REQUIRE_COMPLIANT", True)
-REQUIRE_DEVICE_FOR_USER_CERT = env_bool("REQUIRE_DEVICE_FOR_USER_CERT", True)
-MAX_LAST_SYNC_HOURS = env_int("MAX_LAST_SYNC_HOURS", 72)
-IGNORE_LAST_SYNC = env_bool("IGNORE_LAST_SYNC", False)
+POLICY_RULES_FILE = os.getenv("POLICY_RULES_FILE", "/config/policy.json")
 
 GRAPH_TIMEOUT_SECONDS = env_int("GRAPH_TIMEOUT_SECONDS", 20)
 GRAPH_MAX_RETRIES = env_int("GRAPH_MAX_RETRIES", 1)
 
 TRUST_CHAIN_FALLBACK = env_bool("TRUST_CHAIN_FALLBACK", False)
+
+# Optional on-prem AD device lookup over LDAPS, keyed off the cert's
+# onprem-sid SAN URI (Intune SCEP strong mapping via {{OnPremisesSecurityIdentifier}}).
+AD_LDAP_ENABLED = env_bool("AD_LDAP_ENABLED", False)
+AD_LDAP_SERVER = os.getenv("AD_LDAP_SERVER", "")
+AD_LDAP_PORT = env_int("AD_LDAP_PORT", 636)
+AD_LDAP_USE_SSL = env_bool("AD_LDAP_USE_SSL", True)
+AD_LDAP_VERIFY_CERT = env_bool("AD_LDAP_VERIFY_CERT", True)
+AD_LDAP_BIND_USERNAME = os.getenv("AD_LDAP_BIND_USERNAME", "")
+AD_LDAP_BIND_PASSWORD = os.getenv("AD_LDAP_BIND_PASSWORD", "")
+AD_LDAP_BASE_DN = os.getenv("AD_LDAP_BASE_DN", "")
+AD_LDAP_TIMEOUT_SECONDS = env_int("AD_LDAP_TIMEOUT_SECONDS", 10)
 
 CACHE_BACKEND = os.getenv("CACHE_BACKEND", "sqlite").strip().lower()
 CACHE_DB_PATH = os.getenv("CACHE_DB_PATH", "/data/intune-radius-cache.sqlite3")
@@ -134,6 +145,13 @@ def age_seconds(fetched_at: Optional[str]) -> Optional[float]:
     if not dt:
         return None
     return (now_utc() - dt).total_seconds()
+
+
+def age_hours(value: Optional[str]) -> Optional[float]:
+    dt = parse_dt(value)
+    if not dt:
+        return None
+    return (now_utc() - dt).total_seconds() / 3600
 
 
 def is_fresh(fetched_at: Optional[str], max_age_seconds: int) -> bool:
@@ -510,10 +528,12 @@ def extract_identity(cert_pem: str) -> dict[str, Any]:
     entra_device_id = None
     user_upn = None
     entra_user_id = None
+    onprem_sid = None
 
     device_prefix = f"{URN_PREFIX}:entra-device-id:"
     upn_prefix = f"{URN_PREFIX}:user-upn:"
     user_id_prefix = f"{URN_PREFIX}:entra-user-id:"
+    onprem_sid_prefix = f"{URN_PREFIX}:onprem-sid:"
 
     for uri in uris:
         if uri.startswith(device_prefix):
@@ -522,50 +542,25 @@ def extract_identity(cert_pem: str) -> dict[str, Any]:
             user_upn = uri[len(upn_prefix):].strip().lower()
         elif uri.startswith(user_id_prefix):
             entra_user_id = uri[len(user_id_prefix):].strip().lower()
+        elif uri.startswith(onprem_sid_prefix):
+            onprem_sid = uri[len(onprem_sid_prefix):].strip()
 
     return {
         "entra_device_id": entra_device_id,
         "user_upn": user_upn,
         "entra_user_id": entra_user_id,
+        "onprem_sid": onprem_sid,
         "emails": emails,
         "uris": uris,
     }
 
 
 def evaluate_managed_device(managed: dict[str, Any], entra_device: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    compliance_state = (managed.get("complianceState") or "").lower()
-    last_sync = managed.get("lastSyncDateTime")
-    last_sync_dt = parse_dt(last_sync)
+    """Normalize a Graph managedDevice (+ optional Entra device) into cache-friendly fields.
 
-    allow = True
-    reasons = []
-
-    if REQUIRE_COMPLIANT and compliance_state != "compliant":
-        allow = False
-        reasons.append(f"device complianceState is {compliance_state or 'missing'}")
-
-    last_sync_status = "ignored"
-    if not IGNORE_LAST_SYNC:
-        if not last_sync_dt:
-            allow = False
-            last_sync_status = "missing"
-            reasons.append("lastSyncDateTime missing")
-        else:
-            age_hours = (now_utc() - last_sync_dt).total_seconds() / 3600
-            if age_hours > MAX_LAST_SYNC_HOURS:
-                allow = False
-                last_sync_status = f"older than {MAX_LAST_SYNC_HOURS}h"
-                reasons.append(f"lastSyncDateTime older than {MAX_LAST_SYNC_HOURS}h")
-            else:
-                last_sync_status = "ok"
-
-    if entra_device is not None and entra_device.get("accountEnabled") is False:
-        allow = False
-        reasons.append("Entra device accountEnabled is false")
-
-    if not reasons:
-        reasons.append("device allowed")
-
+    Carries no allow/deny opinion - that decision is made by the policy engine
+    from the facts this produces, at request time (see build_facts/evaluate_policy).
+    """
     device_id = (
         managed.get("azureADDeviceId")
         or managed.get("entraDeviceId")
@@ -574,18 +569,11 @@ def evaluate_managed_device(managed: dict[str, Any], entra_device: Optional[dict
     )
 
     return {
-        "allow": allow,
-        "reason": "; ".join(reasons),
         "id": managed.get("id"),
         "deviceName": managed.get("deviceName") or managed.get("displayName"),
         "entraDeviceId": str(device_id).lower(),
         "complianceState": managed.get("complianceState"),
-        "lastSyncDateTime": last_sync,
-        "lastSyncPolicy": {
-            "ignoreLastSync": IGNORE_LAST_SYNC,
-            "maxLastSyncHours": MAX_LAST_SYNC_HOURS,
-            "lastSyncStatus": last_sync_status,
-        },
+        "lastSyncDateTime": managed.get("lastSyncDateTime"),
         "userPrincipalName": managed.get("userPrincipalName"),
         "managementAgent": managed.get("managementAgent"),
         "operatingSystem": managed.get("operatingSystem"),
@@ -595,24 +583,191 @@ def evaluate_managed_device(managed: dict[str, Any], entra_device: Optional[dict
 
 
 def evaluate_user(user: dict[str, Any]) -> dict[str, Any]:
-    allow = True
-    reasons = []
-
-    if user.get("accountEnabled") is False:
-        allow = False
-        reasons.append("user accountEnabled is false")
-
-    if not reasons:
-        reasons.append("user allowed")
-
+    """Normalize a Graph user into cache-friendly fields - no allow/deny opinion, see evaluate_managed_device."""
     return {
-        "allow": allow,
-        "reason": "; ".join(reasons),
         "id": user.get("id"),
         "userPrincipalName": (user.get("userPrincipalName") or "").lower(),
         "accountEnabled": user.get("accountEnabled"),
         "displayName": user.get("displayName"),
         "fetched_at": iso_now(),
+    }
+
+
+DEFAULT_POLICY: dict[str, Any] = {
+    "version": 1,
+    "defaultTier": "reject",
+    "rules": [
+        {
+            "name": "user-cert-missing-device-pairing",
+            "when": {"all": [
+                {"field": "cert_type", "op": "eq", "value": "user"},
+                {"field": "device_id_present_in_cert", "op": "eq", "value": False},
+            ]},
+            "tier": "reject",
+            "reason": "user certificate missing required entra-device-id URN",
+        },
+        {
+            "name": "user-cert-unresolved",
+            "when": {"all": [
+                {"field": "user_upn_present_in_cert", "op": "eq", "value": True},
+                {"field": "user_found", "op": "eq", "value": False},
+            ]},
+            "tier": "reject",
+            "reason": "user certificate identity could not be resolved against Entra",
+        },
+        {
+            "name": "disabled-user-reject",
+            "when": {"field": "user_account_enabled", "op": "eq", "value": False},
+            "tier": "reject",
+            "reason": "user account disabled",
+        },
+        {
+            "name": "disabled-device-reject",
+            "when": {"field": "device_account_enabled", "op": "eq", "value": False},
+            "tier": "reject",
+            "reason": "device account disabled",
+        },
+        {
+            "name": "compliant-device-access",
+            "when": {"all": [
+                {"field": "device_found", "op": "eq", "value": True},
+                {"field": "compliance_state", "op": "eq", "value": "compliant"},
+                {"field": "last_sync_age_hours", "op": "lte", "value": 72},
+            ]},
+            "tier": "access",
+            "reason": "device compliant",
+        },
+        {
+            "name": "known-noncompliant-device-untrust",
+            "when": {"field": "device_found", "op": "eq", "value": True},
+            "tier": "untrust",
+            "reason": "device enrolled but not compliant",
+        },
+    ],
+}
+
+_policy_load_error: Optional[str] = None
+
+
+def load_policy() -> dict[str, Any]:
+    global _policy_load_error
+
+    if not POLICY_RULES_FILE or not os.path.isfile(POLICY_RULES_FILE):
+        _policy_load_error = None
+        return DEFAULT_POLICY
+
+    try:
+        with open(POLICY_RULES_FILE, "r", encoding="utf-8") as f:
+            policy = json.load(f)
+        _policy_load_error = None
+        return policy
+    except Exception as exc:
+        # Fail closed: an unreadable/invalid policy file must not silently
+        # fall back to the (potentially far more permissive) default ruleset.
+        _policy_load_error = str(exc)
+        return {"version": 1, "defaultTier": "reject", "rules": []}
+
+
+def eval_condition(condition: dict[str, Any], facts: dict[str, Any]) -> bool:
+    if "all" in condition:
+        return all(eval_condition(c, facts) for c in condition["all"])
+    if "any" in condition:
+        return any(eval_condition(c, facts) for c in condition["any"])
+    if "not" in condition:
+        return not eval_condition(condition["not"], facts)
+
+    field = condition["field"]
+    op = condition["op"]
+    actual = facts.get(field)
+
+    if op == "exists":
+        return actual is not None
+    if op == "eq":
+        return actual == condition.get("value")
+    if op == "neq":
+        return actual != condition.get("value")
+    if op == "in":
+        return actual in condition.get("value", [])
+    if actual is None:
+        return False
+    if op == "gt":
+        return actual > condition["value"]
+    if op == "gte":
+        return actual >= condition["value"]
+    if op == "lt":
+        return actual < condition["value"]
+    if op == "lte":
+        return actual <= condition["value"]
+
+    raise ValueError(f"unknown policy condition operator: {op}")
+
+
+def evaluate_policy(policy: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
+    for rule in policy.get("rules", []):
+        condition = rule.get("when")
+        if condition is None or eval_condition(condition, facts):
+            return {
+                "tier": rule["tier"],
+                "reason": rule.get("reason", rule.get("name", "matched")),
+                "matchedRule": rule.get("name"),
+            }
+
+    return {
+        "tier": policy.get("defaultTier", "reject"),
+        "reason": "no policy rule matched",
+        "matchedRule": None,
+    }
+
+
+def build_facts(
+    identity: dict[str, Any],
+    cert_type: str,
+    device_result: Optional[dict[str, Any]],
+    user_result: Optional[dict[str, Any]],
+    ad_device_result: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    facts: dict[str, Any] = {
+        "cert_type": cert_type,
+        "device_id_present_in_cert": bool(identity.get("entra_device_id")),
+        "user_upn_present_in_cert": bool(identity.get("user_upn")),
+        "onprem_sid_present_in_cert": bool(identity.get("onprem_sid")),
+        "device_found": False,
+        "compliance_state": None,
+        "last_sync_age_hours": None,
+        "device_account_enabled": None,
+        "user_found": False,
+        "user_account_enabled": None,
+        "ad_device_found": False,
+        "ad_device_enabled": None,
+    }
+
+    if device_result is not None:
+        facts["device_found"] = bool(device_result.get("id"))
+        compliance_state = device_result.get("complianceState")
+        facts["compliance_state"] = compliance_state.lower() if compliance_state else None
+        facts["last_sync_age_hours"] = age_hours(device_result.get("lastSyncDateTime"))
+        entra_device = device_result.get("entraDevice")
+        if entra_device is not None:
+            facts["device_account_enabled"] = entra_device.get("accountEnabled")
+
+    if user_result is not None:
+        facts["user_found"] = bool(user_result.get("id"))
+        facts["user_account_enabled"] = user_result.get("accountEnabled")
+
+    if ad_device_result is not None:
+        facts["ad_device_found"] = bool(ad_device_result.get("found"))
+        facts["ad_device_enabled"] = ad_device_result.get("accountEnabled")
+
+    return facts
+
+
+def reject_event(reason: str, checks: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tier": "reject",
+        "allow": False,
+        "reason": reason,
+        "matchedRule": None,
+        "checks": checks,
     }
 
 
@@ -629,7 +784,6 @@ async def live_graph_device_lookup(entra_device_id: str) -> dict[str, Any]:
     managed_values = managed_response.get("value", [])
     if not managed_values:
         return {
-            "allow": False,
             "reason": "device not found in Intune managedDevices",
             "entraDeviceId": entra_device_id,
             "fetched_at": iso_now(),
@@ -706,7 +860,6 @@ async def check_device(entra_device_id: str) -> dict[str, Any]:
             return data
 
         return {
-            "allow": False,
             "reason": "Graph device lookup failed and no usable cache exists",
             "entraDeviceId": entra_device_id.lower(),
             "_decisionSource": "graph_error_no_cache",
@@ -748,11 +901,129 @@ async def check_user(user_upn: str) -> dict[str, Any]:
             return data
 
         return {
-            "allow": False,
             "reason": "Graph user lookup failed and no usable cache exists",
             "userPrincipalName": user_upn.lower(),
             "_decisionSource": "graph_error_no_cache",
             "_graphError": graph_error,
+            "fetched_at": iso_now(),
+        }
+
+
+def sid_to_ldap_filter_value(sid: str) -> str:
+    """Convert an SDDL SID string (S-1-5-21-...-RID) into the escaped byte
+    sequence AD's binary objectSid attribute requires for LDAP filtering."""
+    parts = sid.strip().split("-")
+    if len(parts) < 3 or parts[0].upper() != "S":
+        raise ValueError(f"not a valid SID string: {sid!r}")
+
+    revision = int(parts[1])
+    identifier_authority = int(parts[2])
+    sub_authorities = [int(p) for p in parts[3:]]
+
+    raw = bytearray()
+    raw.append(revision)
+    raw.append(len(sub_authorities))
+    raw += identifier_authority.to_bytes(6, byteorder="big")
+    for sub_authority in sub_authorities:
+        raw += sub_authority.to_bytes(4, byteorder="little")
+
+    return "".join(f"\\{b:02x}" for b in raw)
+
+
+def _ldap_connection() -> ldap3.Connection:
+    tls = ldap3.Tls(
+        validate=ssl.CERT_REQUIRED if AD_LDAP_VERIFY_CERT else ssl.CERT_NONE,
+    )
+    server = ldap3.Server(
+        AD_LDAP_SERVER,
+        port=AD_LDAP_PORT,
+        use_ssl=AD_LDAP_USE_SSL,
+        tls=tls,
+        connect_timeout=AD_LDAP_TIMEOUT_SECONDS,
+    )
+    return ldap3.Connection(
+        server,
+        user=AD_LDAP_BIND_USERNAME,
+        password=AD_LDAP_BIND_PASSWORD,
+        authentication=ldap3.SIMPLE,
+        auto_bind=True,
+        receive_timeout=AD_LDAP_TIMEOUT_SECONDS,
+    )
+
+
+ACCOUNTDISABLE = 0x2
+
+
+def _ldap_search_device_by_sid(onprem_sid: str) -> dict[str, Any]:
+    filter_value = sid_to_ldap_filter_value(onprem_sid)
+    search_filter = f"(&(objectClass=computer)(objectSid={filter_value}))"
+
+    conn = _ldap_connection()
+    try:
+        conn.search(
+            search_base=AD_LDAP_BASE_DN,
+            search_filter=search_filter,
+            attributes=["distinguishedName", "sAMAccountName", "userAccountControl"],
+        )
+        if not conn.entries:
+            return {"found": False}
+
+        entry = conn.entries[0]
+        uac = int(entry.userAccountControl.value) if entry.userAccountControl else 0
+
+        return {
+            "found": True,
+            "distinguishedName": str(entry.distinguishedName) if entry.distinguishedName else None,
+            "sAMAccountName": str(entry.sAMAccountName) if entry.sAMAccountName else None,
+            "accountEnabled": not bool(uac & ACCOUNTDISABLE),
+        }
+    finally:
+        conn.unbind()
+
+
+async def live_ad_device_lookup(onprem_sid: str) -> dict[str, Any]:
+    result = await asyncio.to_thread(_ldap_search_device_by_sid, onprem_sid)
+    result["fetched_at"] = iso_now()
+    result["_decisionSource"] = "live_ldap"
+    return result
+
+
+async def check_ad_device(onprem_sid: str) -> dict[str, Any]:
+    cache_key = f"ad_device:{onprem_sid.lower()}"
+
+    mem = memory_get(cache_key)
+    if mem:
+        return mem
+
+    cached = await cache_get(cache_key)
+
+    if LOCAL_CACHE_FIRST and cached and is_fresh(cached.get("fetched_at"), LOCAL_CACHE_MAX_AGE_SECONDS):
+        data = dict(cached["data"])
+        data["_decisionSource"] = "local_cache"
+        memory_set(cache_key, data)
+        return data
+
+    try:
+        result = await live_ad_device_lookup(onprem_sid)
+        await cache_set(cache_key, "ad_device", onprem_sid.lower(), result)
+        memory_set(cache_key, result)
+        return result
+    except Exception as exc:
+        ldap_error = {
+            "message": str(exc),
+        }
+
+        if ALLOW_STALE_CACHE_ON_GRAPH_ERROR and cached and is_stale_usable(cached.get("fetched_at")):
+            data = dict(cached["data"])
+            data["_decisionSource"] = "stale_persistent_cache"
+            data["_ldapError"] = ldap_error
+            memory_set(cache_key, data)
+            return data
+
+        return {
+            "found": False,
+            "_decisionSource": "ldap_error_no_cache",
+            "_ldapError": ldap_error,
             "fetched_at": iso_now(),
         }
 
@@ -907,6 +1178,8 @@ async def healthz() -> dict[str, Any]:
         except Exception as exc:
             postgres_ok = str(exc)
 
+    policy = load_policy()
+
     return {
         "ok": True,
         "cacheBackend": CACHE_BACKEND,
@@ -914,10 +1187,11 @@ async def healthz() -> dict[str, Any]:
         "localCacheMaxAgeSeconds": LOCAL_CACHE_MAX_AGE_SECONDS,
         "redis": redis_ok,
         "postgres": postgres_ok,
-        "requireCompliant": REQUIRE_COMPLIANT,
-        "requireDeviceForUserCert": REQUIRE_DEVICE_FOR_USER_CERT,
-        "ignoreLastSync": IGNORE_LAST_SYNC,
-        "maxLastSyncHours": MAX_LAST_SYNC_HOURS,
+        "policyRulesFile": POLICY_RULES_FILE,
+        "policySource": "file" if os.path.isfile(POLICY_RULES_FILE) else "default",
+        "policyLoadError": _policy_load_error,
+        "policyRuleCount": len(policy.get("rules", [])),
+        "policyDefaultTier": policy.get("defaultTier"),
         "allowStaleCacheOnGraphError": ALLOW_STALE_CACHE_ON_GRAPH_ERROR,
         "maxStaleCacheHours": MAX_STALE_CACHE_HOURS,
         "deviceCacheRefreshSeconds": DEVICE_CACHE_REFRESH_SECONDS,
@@ -925,6 +1199,9 @@ async def healthz() -> dict[str, Any]:
         "userCacheRefreshSeconds": USER_CACHE_REFRESH_SECONDS,
         "userCacheSource": USER_CACHE_SOURCE,
         "trustChainFallback": TRUST_CHAIN_FALLBACK,
+        "adLdapEnabled": AD_LDAP_ENABLED,
+        "adLdapServer": AD_LDAP_SERVER if AD_LDAP_ENABLED else None,
+        "adLdapVerifyCert": AD_LDAP_VERIFY_CERT,
     }
 
 
@@ -942,6 +1219,26 @@ async def refresh_users() -> JSONResponse:
     try:
         result = await refresh_user_cache_once()
         return JSONResponse(result, status_code=200)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/debug/ad-device")
+async def debug_ad_device(request: Request) -> JSONResponse:
+    """Bypasses the cache to test the live AD/LDAPS device lookup directly -
+    for confirming connectivity/bind/base-DN/filter against a real DC without
+    waiting for an actual RADIUS auth or going through /check's caching."""
+    if not AD_LDAP_ENABLED:
+        return JSONResponse({"ok": False, "error": "AD_LDAP_ENABLED is false"}, status_code=400)
+
+    body = await request.json()
+    onprem_sid = body.get("onprem_sid") or body.get("sid") or ""
+    if not onprem_sid:
+        return JSONResponse({"ok": False, "error": "missing onprem_sid"}, status_code=400)
+
+    try:
+        result = await live_ad_device_lookup(onprem_sid)
+        return JSONResponse({"ok": True, "result": result}, status_code=200)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -981,8 +1278,10 @@ async def check(request: Request) -> JSONResponse:
 
     if TRUST_CHAIN_FALLBACK:
         event = {
+            "tier": "access",
             "allow": True,
             "reason": "TRUST_CHAIN_FALLBACK enabled; FreeRADIUS certificate validation already succeeded",
+            "matchedRule": None,
             "checks": checks,
         }
         log_event(event)
@@ -990,11 +1289,7 @@ async def check(request: Request) -> JSONResponse:
         return JSONResponse(event, status_code=200)
 
     if not cert_pem:
-        event = {
-            "allow": False,
-            "reason": "missing cert_pem",
-            "checks": checks,
-        }
+        event = reject_event("missing cert_pem", checks)
         log_event(event)
         await postgres_log_auth_event(event)
         return JSONResponse(event, status_code=403)
@@ -1002,11 +1297,7 @@ async def check(request: Request) -> JSONResponse:
     try:
         identity = extract_identity(cert_pem)
     except Exception as exc:
-        event = {
-            "allow": False,
-            "reason": f"failed to parse certificate identity: {exc}",
-            "checks": checks,
-        }
+        event = reject_event(f"failed to parse certificate identity: {exc}", checks)
         log_event(event)
         await postgres_log_auth_event(event)
         return JSONResponse(event, status_code=403)
@@ -1019,52 +1310,46 @@ async def check(request: Request) -> JSONResponse:
     checks["certType"] = cert_type
 
     if not entra_device_id and not user_upn:
-        event = {
-            "allow": False,
-            "reason": "certificate does not contain expected URN identity",
-            "checks": checks,
-        }
+        event = reject_event("certificate does not contain expected URN identity", checks)
         log_event(event)
         await postgres_log_auth_event(event)
         return JSONResponse(event, status_code=403)
 
-    if cert_type == "user" and REQUIRE_DEVICE_FOR_USER_CERT and not entra_device_id:
-        event = {
-            "allow": False,
-            "reason": "user certificate missing required entra-device-id URN",
-            "checks": checks,
-        }
-        log_event(event)
-        await postgres_log_auth_event(event)
-        return JSONResponse(event, status_code=403)
-
-    allow = True
-    reasons = []
+    device_result = None
+    user_result = None
+    ad_device_result = None
 
     if entra_device_id:
         device_result = await check_device(entra_device_id)
         checks["device"] = device_result
-        if not device_result.get("allow"):
-            allow = False
-            reasons.append(device_result.get("reason", "device denied"))
 
     if user_upn:
         user_result = await check_user(user_upn)
         checks["user"] = user_result
-        if not user_result.get("allow"):
-            allow = False
-            reasons.append(user_result.get("reason", "user denied"))
 
-    if not reasons:
-        reasons.append("allowed")
+    onprem_sid = identity.get("onprem_sid")
+    if AD_LDAP_ENABLED and onprem_sid:
+        ad_device_result = await check_ad_device(onprem_sid)
+        checks["adDevice"] = ad_device_result
+
+    facts = build_facts(identity, cert_type, device_result, user_result, ad_device_result)
+    checks["facts"] = facts
+
+    policy = load_policy()
+    if _policy_load_error:
+        decision = {"tier": "reject", "reason": f"invalid policy file: {_policy_load_error}", "matchedRule": None}
+    else:
+        decision = evaluate_policy(policy, facts)
 
     event = {
-        "allow": allow,
-        "reason": "; ".join(reasons),
+        "tier": decision["tier"],
+        "allow": decision["tier"] == "access",
+        "reason": decision["reason"],
+        "matchedRule": decision["matchedRule"],
         "checks": checks,
     }
 
     log_event(event)
     await postgres_log_auth_event(event)
 
-    return JSONResponse(event, status_code=200 if allow else 403)
+    return JSONResponse(event, status_code=200 if decision["tier"] == "access" else 403)
