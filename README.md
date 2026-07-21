@@ -6,14 +6,18 @@ A small FastAPI service that lets FreeRADIUS (or any EAP-TLS RADIUS server) gate
 authentication on live Microsoft Intune device compliance and Entra ID account
 status, keyed off identifiers embedded in the client certificate's SAN URIs.
 
-It is designed to sit behind a RADIUS server's `verify { client = ... }` hook:
-the RADIUS server does the certificate chain/EKU validation, then calls this
+It's a plain HTTP service with no opinion about when it's called - the
+RADIUS server does its own certificate chain/EKU validation, then calls this
 service's `POST /check` with the client cert (PEM) and RADIUS username; the
 service extracts an Entra device ID / user UPN from the cert's SAN URIs,
 checks Intune `managedDevices` compliance and Entra account status via
 Microsoft Graph, evaluates a declarative JSON policy against those facts to
 pick a tier (`access` / `untrust` / `reject`), and returns `200` (access) or
 `403` (untrust or reject) accordingly.
+[intune-radius-stack](https://github.com/griefersutherland/intune-radius-stack)
+calls it from RADIUS's `post-auth` phase rather than the EAP-TLS
+`verify { client = ... }` hook specifically so a non-`access` tier can still
+land on a different VLAN instead of only ever being able to reject outright.
 
 ## Certificate identity convention
 
@@ -54,9 +58,12 @@ Returns:
 ```
 
 `allow` is `true` only when `tier` is `access`; `untrust` and `reject` both
-return HTTP `403` today (`allow: false`) - see "Policy engine" below for what
-distinguishes them and why "untrust" doesn't yet get separate treatment on
-the wire.
+return HTTP `403` (`allow: false`) at this endpoint - the distinction between
+them is carried in the `tier` field of the response body, not the status
+code. See "Policy engine" below and
+[intune-radius-stack](https://github.com/griefersutherland/intune-radius-stack)'s
+README for how that consumes `tier` to land `untrust` on a different VLAN
+than an outright `reject`.
 
 `GET /healthz` reports cache backend health and effective policy config
 (`policyRulesFile`, `policySource`, `policyLoadError`, `policyRuleCount`).
@@ -100,14 +107,17 @@ and if it exists but fails to parse, **every request is rejected** (loud and
 fail-closed, rather than silently falling back to a maybe-more-permissive
 default) - check `policyLoadError` on `/healthz`.
 
-Note that `untrust` and `reject` currently produce the same HTTP `403` from
-`/check` - FreeRADIUS's `verify { client = ... }` hook (see
+`untrust` and `reject` both produce HTTP `403` from `/check` - a consumer
+that only looks at the status code can't tell them apart. FreeRADIUS's
+`verify { client = ... }` hook (see
 [intune-radius-stack](https://github.com/griefersutherland/intune-radius-stack))
-hard-fails the TLS handshake on any non-200, so there's no way yet for a
-denied client to land on a different VLAN instead of being rejected outright.
-The `tier` field is there for that future integration; today it's informational
-(visible in `/check` responses, `intune-auth.log`, and the `auth_events`
-Postgres table when `CACHE_BACKEND=postgres_redis`).
+can't either, since a non-200 there hard-fails the TLS handshake before any
+VLAN could ever be assigned - which is why that stack's actual compliance
+check now happens later, in RADIUS's `post-auth` phase, where it can read
+the `tier` field directly and land `untrust` on a different VLAN than a
+`reject`. Every `tier` decision is also visible in `/check` responses,
+`intune-auth.log`, and the `auth_events` Postgres table when
+`CACHE_BACKEND=postgres_redis`.
 
 ### On-prem AD device lookup (optional)
 
