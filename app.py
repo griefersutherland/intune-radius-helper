@@ -79,6 +79,8 @@ AD_LDAP_BIND_PASSWORD = os.getenv("AD_LDAP_BIND_PASSWORD", "")
 AD_LDAP_BASE_DN = os.getenv("AD_LDAP_BASE_DN", "")
 AD_LDAP_TIMEOUT_SECONDS = env_int("AD_LDAP_TIMEOUT_SECONDS", 10)
 
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
 CACHE_BACKEND = os.getenv("CACHE_BACKEND", "sqlite").strip().lower()
 CACHE_DB_PATH = os.getenv("CACHE_DB_PATH", "/data/intune-radius-cache.sqlite3")
 
@@ -238,6 +240,18 @@ async def postgres_init() -> None:
                 source_device text,
                 source_user text,
                 event_json jsonb not null
+            )
+            """
+        )
+        await conn.execute(
+            """
+            create table if not exists blocked_devices (
+                id bigserial primary key,
+                identifier_type text not null,
+                identifier_value text not null,
+                reason text,
+                blocked_at timestamptz not null default now(),
+                unique (identifier_type, identifier_value)
             )
             """
         )
@@ -424,6 +438,61 @@ async def postgres_log_auth_event(event: dict[str, Any]) -> None:
             user.get("_decisionSource"),
             json.dumps(event, default=str),
         )
+
+
+BLOCK_IDENTIFIER_TYPES = ("mac", "entra_device_id", "ad_sid")
+
+
+def normalize_mac(value: str) -> str:
+    return re.sub(r"[^0-9a-f]", "", value.lower())
+
+
+async def is_device_blocked(
+    mac: str = "", entra_device_id: str = "", onprem_sid: str = ""
+) -> Optional[dict[str, Any]]:
+    # Device blocking is a Postgres-backed override, checked live (never
+    # cached) so a block takes effect on the very next request - not
+    # available on the sqlite backend.
+    if CACHE_BACKEND != "postgres_redis" or not pg_pool:
+        return None
+
+    identifiers: list[tuple[str, str]] = []
+    if mac:
+        identifiers.append(("mac", normalize_mac(mac)))
+    if entra_device_id:
+        identifiers.append(("entra_device_id", entra_device_id))
+    if onprem_sid:
+        identifiers.append(("ad_sid", onprem_sid))
+    if not identifiers:
+        return None
+
+    async with pg_pool.acquire() as conn:
+        for identifier_type, identifier_value in identifiers:
+            if not identifier_value:
+                continue
+            row = await conn.fetchrow(
+                "select identifier_type, identifier_value, reason, blocked_at "
+                "from blocked_devices where identifier_type=$1 and identifier_value=$2",
+                identifier_type,
+                identifier_value,
+            )
+            if row:
+                return dict(row)
+    return None
+
+
+def require_admin_api_key(request: Request) -> Optional[JSONResponse]:
+    # Fail closed: with no ADMIN_API_KEY configured, refuse rather than
+    # accept unauthenticated block/unblock writes.
+    if not ADMIN_API_KEY:
+        return JSONResponse(
+            {"ok": False, "error": "ADMIN_API_KEY is not configured on this server"},
+            status_code=503,
+        )
+    provided = request.headers.get("X-Admin-Api-Key", "")
+    if provided != ADMIN_API_KEY:
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    return None
 
 
 async def graph_token() -> str:
@@ -1180,6 +1249,14 @@ async def healthz() -> dict[str, Any]:
 
     policy = load_policy()
 
+    blocked_device_count = None
+    if CACHE_BACKEND == "postgres_redis" and pg_pool:
+        try:
+            async with pg_pool.acquire() as conn:
+                blocked_device_count = await conn.fetchval("select count(*) from blocked_devices")
+        except Exception:
+            blocked_device_count = None
+
     return {
         "ok": True,
         "cacheBackend": CACHE_BACKEND,
@@ -1202,7 +1279,121 @@ async def healthz() -> dict[str, Any]:
         "adLdapEnabled": AD_LDAP_ENABLED,
         "adLdapServer": AD_LDAP_SERVER if AD_LDAP_ENABLED else None,
         "adLdapVerifyCert": AD_LDAP_VERIFY_CERT,
+        "adminApiKeyConfigured": bool(ADMIN_API_KEY),
+        "blockedDeviceCount": blocked_device_count,
     }
+
+
+@app.post("/block-device")
+async def block_device(request: Request) -> JSONResponse:
+    auth_error = require_admin_api_key(request)
+    if auth_error:
+        return auth_error
+
+    if CACHE_BACKEND != "postgres_redis" or not pg_pool:
+        return JSONResponse(
+            {"ok": False, "error": "device blocking requires CACHE_BACKEND=postgres_redis"},
+            status_code=400,
+        )
+
+    body = await request.json()
+    identifier_type = (body.get("identifier_type") or "").strip().lower()
+    identifier_value = (body.get("identifier_value") or "").strip()
+    reason = body.get("reason") or None
+
+    if identifier_type not in BLOCK_IDENTIFIER_TYPES:
+        return JSONResponse(
+            {"ok": False, "error": f"identifier_type must be one of {BLOCK_IDENTIFIER_TYPES}"},
+            status_code=400,
+        )
+    if not identifier_value:
+        return JSONResponse({"ok": False, "error": "missing identifier_value"}, status_code=400)
+
+    if identifier_type == "mac":
+        identifier_value = normalize_mac(identifier_value)
+
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            insert into blocked_devices(identifier_type, identifier_value, reason)
+            values ($1, $2, $3)
+            on conflict (identifier_type, identifier_value)
+            do update set reason = excluded.reason, blocked_at = now()
+            returning identifier_type, identifier_value, reason, blocked_at
+            """,
+            identifier_type,
+            identifier_value,
+            reason,
+        )
+
+    blocked_row = dict(row)
+    blocked_row["blocked_at"] = blocked_row["blocked_at"].astimezone(timezone.utc).isoformat()
+    return JSONResponse({"ok": True, "blocked": blocked_row}, status_code=200)
+
+
+@app.post("/unblock-device")
+async def unblock_device(request: Request) -> JSONResponse:
+    auth_error = require_admin_api_key(request)
+    if auth_error:
+        return auth_error
+
+    if CACHE_BACKEND != "postgres_redis" or not pg_pool:
+        return JSONResponse(
+            {"ok": False, "error": "device blocking requires CACHE_BACKEND=postgres_redis"},
+            status_code=400,
+        )
+
+    body = await request.json()
+    identifier_type = (body.get("identifier_type") or "").strip().lower()
+    identifier_value = (body.get("identifier_value") or "").strip()
+
+    if identifier_type not in BLOCK_IDENTIFIER_TYPES:
+        return JSONResponse(
+            {"ok": False, "error": f"identifier_type must be one of {BLOCK_IDENTIFIER_TYPES}"},
+            status_code=400,
+        )
+    if not identifier_value:
+        return JSONResponse({"ok": False, "error": "missing identifier_value"}, status_code=400)
+
+    if identifier_type == "mac":
+        identifier_value = normalize_mac(identifier_value)
+
+    async with pg_pool.acquire() as conn:
+        result = await conn.execute(
+            "delete from blocked_devices where identifier_type=$1 and identifier_value=$2",
+            identifier_type,
+            identifier_value,
+        )
+
+    removed = int(result.split()[-1]) > 0
+    return JSONResponse({"ok": True, "removed": removed}, status_code=200)
+
+
+@app.get("/blocked-devices")
+async def list_blocked_devices(request: Request) -> JSONResponse:
+    auth_error = require_admin_api_key(request)
+    if auth_error:
+        return auth_error
+
+    if CACHE_BACKEND != "postgres_redis" or not pg_pool:
+        return JSONResponse(
+            {"ok": False, "error": "device blocking requires CACHE_BACKEND=postgres_redis"},
+            status_code=400,
+        )
+
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "select identifier_type, identifier_value, reason, blocked_at "
+            "from blocked_devices order by blocked_at desc"
+        )
+
+    blocked_list = []
+    for row in rows:
+        item = dict(row)
+        item["blocked_at"] = item["blocked_at"].astimezone(timezone.utc).isoformat()
+        blocked_list.append(item)
+
+    return JSONResponse({"ok": True, "blocked": blocked_list}, status_code=200)
 
 
 @app.post("/refresh/devices")
@@ -1276,6 +1467,16 @@ async def check(request: Request) -> JSONResponse:
         "callingStationId": calling_station_id,
     }
 
+    # Checked first and unconditionally - overrides TRUST_CHAIN_FALLBACK and
+    # the declarative policy engine both, since a block is meant to be an
+    # absolute kill switch regardless of any other configured escape hatch.
+    blocked = await is_device_blocked(mac=calling_station_id)
+    if blocked:
+        event = reject_event(f"device blocked: {blocked.get('reason') or 'no reason given'}", checks)
+        log_event(event)
+        await postgres_log_auth_event(event)
+        return JSONResponse(event, status_code=403)
+
     if TRUST_CHAIN_FALLBACK:
         event = {
             "tier": "access",
@@ -1311,6 +1512,14 @@ async def check(request: Request) -> JSONResponse:
 
     if not entra_device_id and not user_upn:
         event = reject_event("certificate does not contain expected URN identity", checks)
+        log_event(event)
+        await postgres_log_auth_event(event)
+        return JSONResponse(event, status_code=403)
+
+    onprem_sid_early = identity.get("onprem_sid")
+    blocked = await is_device_blocked(entra_device_id=entra_device_id or "", onprem_sid=onprem_sid_early or "")
+    if blocked:
+        event = reject_event(f"device blocked: {blocked.get('reason') or 'no reason given'}", checks)
         log_event(event)
         await postgres_log_auth_event(event)
         return JSONResponse(event, status_code=403)

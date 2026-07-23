@@ -168,6 +168,41 @@ This calls the live LDAP lookup directly (bypassing the cache), so a
 connectivity, bind, or filter problem shows up immediately in the response's
 `_ldapError` rather than being masked by a stale cache entry.
 
+## Device blocking
+
+An explicit denylist, independent of Intune/Entra compliance and the policy
+engine above - for immediately cutting off a stolen/terminated device
+regardless of what Graph or AD currently reports about it. Requires
+`CACHE_BACKEND=postgres_redis` (backed by a `blocked_devices` table) and
+`ADMIN_API_KEY` set - with no key configured, the endpoints below refuse
+every request rather than accept unauthenticated writes.
+
+A block is checked live (never cached) on every `/check` call, and short-circuits
+*everything else* - including `TRUST_CHAIN_FALLBACK` and the declarative
+policy engine - so it can't be bypassed by a custom `policy.json`. It's
+checked once by MAC (`Calling-Station-Id`) before the certificate is even
+parsed, and again by Entra device ID / AD SID once the cert identity is
+extracted, so a block still applies across a NIC swap if the identity in the
+cert is what's blocked.
+
+```bash
+# block (identifier_type is one of: mac, entra_device_id, ad_sid)
+curl -X POST http://localhost:8080/block-device \
+  -H "X-Admin-Api-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"identifier_type": "mac", "identifier_value": "aa:bb:cc:dd:ee:ff", "reason": "reported stolen"}'
+
+# unblock
+curl -X POST http://localhost:8080/unblock-device \
+  -H "X-Admin-Api-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"identifier_type": "mac", "identifier_value": "aa:bb:cc:dd:ee:ff"}'
+
+# list
+curl -H "X-Admin-Api-Key: $ADMIN_API_KEY" http://localhost:8080/blocked-devices
+```
+
+MAC values are normalized (colons/dashes stripped, lowercased) before
+storage and lookup, so any common `Calling-Station-Id` format matches.
+
 ## Configuration
 
 See [`.env.example`](.env.example) for all supported environment variables,
@@ -178,6 +213,7 @@ including:
 - Optional AD/LDAP (`AD_LDAP_*`) - see "On-prem AD device lookup" above
 - Cache backend: `sqlite` (single file, zero external dependencies) or
   `postgres_redis` (for multi-replica / higher-throughput deployments)
+- Device blocking (`ADMIN_API_KEY`) - see "Device blocking" above
 
 ## Running
 
