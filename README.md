@@ -2,6 +2,17 @@
 
 > **Note:** This project is written by Claude (Anthropic) and is still a work in progress. Review it accordingly before relying on it.
 
+## Thanks
+
+This service is a thin layer of glue on top of other people's real
+engineering work. Special thanks to the maintainers of
+[FastAPI](https://fastapi.tiangolo.com/), [httpx](https://www.python-httpx.org/),
+[ldap3](https://github.com/cannatag/ldap3), [asyncpg](https://github.com/MagicStack/asyncpg),
+and [redis-py](https://github.com/redis/redis-py), and to the
+[PostgreSQL](https://www.postgresql.org/) and [Redis](https://redis.io/)
+projects underneath the caching layer - none of this would work, or be
+anywhere near this simple, without their efforts.
+
 A small FastAPI service that lets FreeRADIUS (or any EAP-TLS RADIUS server) gate
 authentication on live Microsoft Intune device compliance and Entra ID account
 status, keyed off identifiers embedded in the client certificate's SAN URIs.
