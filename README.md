@@ -179,6 +179,24 @@ This calls the live LDAP lookup directly (bypassing the cache), so a
 connectivity, bind, or filter problem shows up immediately in the response's
 `_ldapError` rather than being masked by a stale cache entry.
 
+### AD-only mode (no Graph app registration)
+
+Set `GRAPH_ENABLED=false` to skip Microsoft Graph entirely - no token
+requests, no `/deviceManagement/managedDevices` or `/users` calls, and the
+background device/user cache refresh loops never start. Use this when
+`AD_LDAP_ENABLED=true` and on-prem AD is meant to be the sole source of
+truth, with no Intune/Entra app registration provisioned at all.
+
+With `GRAPH_ENABLED=false`, a cert's `onprem-sid` SAN URI alone is enough to
+pass identity extraction (normally at least one of `entra-device-id` /
+`user-upn` is required) - see "Certificate identity convention" above.
+`device_found`, `compliance_state`, and `user_found` are never populated in
+this mode, so the built-in default ruleset (which keys off those facts) will
+fail-closed to `reject` for every request. You must supply a custom
+`policy.json` keyed off `ad_device_found`/`ad_device_enabled` instead - see
+[`policy.ad-only.example.json`](policy.ad-only.example.json) for a ready-to-copy
+ruleset. `TENANT_ID`/`CLIENT_ID`/`CLIENT_SECRET` can be left unset in this mode.
+
 ## Device blocking
 
 An explicit denylist, independent of Intune/Entra compliance and the policy
@@ -219,7 +237,8 @@ storage and lookup, so any common `Calling-Station-Id` format matches.
 See [`.env.example`](.env.example) for all supported environment variables,
 including:
 
-- Graph app registration (`TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`)
+- Graph app registration (`TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`), and
+  `GRAPH_ENABLED` to disable Graph entirely - see "AD-only mode" above
 - Policy (`POLICY_RULES_FILE`, `TRUST_CHAIN_FALLBACK`) - see "Policy engine" above
 - Optional AD/LDAP (`AD_LDAP_*`) - see "On-prem AD device lookup" above
 - Cache backend: `sqlite` (single file, zero external dependencies) or

@@ -1,0 +1,36 @@
+{
+  "_comment": "Example policy for GRAPH_ENABLED=false + AD_LDAP_ENABLED=true deployments, where on-prem AD is the sole source of truth and device_found/user_found/compliance_state are never populated (Graph is never called). Copy this to POLICY_RULES_FILE (default /config/policy.json) and edit. Certs still need an entra-device-id, user-upn, or onprem-sid URN present (see README's 'Certificate identity convention') - only the onprem-sid is actually resolved in this mode.",
+  "version": 1,
+  "defaultTier": "reject",
+  "rules": [
+    {
+      "name": "ad-device-missing-sid",
+      "when": {"field": "onprem_sid_present_in_cert", "op": "eq", "value": false},
+      "tier": "reject",
+      "reason": "certificate missing required onprem-sid URN for AD-only mode"
+    },
+    {
+      "name": "ad-device-not-found",
+      "when": {"field": "ad_device_found", "op": "eq", "value": false},
+      "tier": "reject",
+      "reason": "AD computer account not found"
+    },
+    {
+      "name": "ad-device-disabled-reject",
+      "when": {"field": "ad_device_enabled", "op": "eq", "value": false},
+      "tier": "reject",
+      "reason": "AD computer account disabled"
+    },
+    {
+      "name": "ad-device-access",
+      "when": {
+        "all": [
+          {"field": "ad_device_found", "op": "eq", "value": true},
+          {"field": "ad_device_enabled", "op": "eq", "value": true}
+        ]
+      },
+      "tier": "access",
+      "reason": "AD computer account found and enabled"
+    }
+  ]
+}

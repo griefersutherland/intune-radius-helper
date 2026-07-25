@@ -58,6 +58,13 @@ TENANT_ID = os.getenv("TENANT_ID", "")
 CLIENT_ID = os.getenv("CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 
+# When false, all Intune/Entra (Microsoft Graph) lookups and the background
+# device/user cache refresh loops are skipped entirely - for AD_LDAP_ENABLED
+# deployments that only want the on-prem AD device check as their source of
+# truth, and don't want every RADIUS auth spending time on Graph calls that
+# are never going to succeed (or that they never provisioned an app registration for).
+GRAPH_ENABLED = env_bool("GRAPH_ENABLED", True)
+
 URN_PREFIX = os.getenv("URN_PREFIX", "urn:t0.pac3.net").rstrip(":")
 
 POLICY_RULES_FILE = os.getenv("POLICY_RULES_FILE", "/config/policy.json")
@@ -1220,10 +1227,11 @@ async def startup() -> None:
     else:
         sqlite_init()
 
-    asyncio.create_task(device_cache_loop())
+    if GRAPH_ENABLED:
+        asyncio.create_task(device_cache_loop())
 
-    if USER_CACHE_REFRESH_ENABLED:
-        asyncio.create_task(user_cache_loop())
+        if USER_CACHE_REFRESH_ENABLED:
+            asyncio.create_task(user_cache_loop())
 
 
 @app.get("/healthz")
@@ -1276,6 +1284,7 @@ async def healthz() -> dict[str, Any]:
         "userCacheRefreshSeconds": USER_CACHE_REFRESH_SECONDS,
         "userCacheSource": USER_CACHE_SOURCE,
         "trustChainFallback": TRUST_CHAIN_FALLBACK,
+        "graphEnabled": GRAPH_ENABLED,
         "adLdapEnabled": AD_LDAP_ENABLED,
         "adLdapServer": AD_LDAP_SERVER if AD_LDAP_ENABLED else None,
         "adLdapVerifyCert": AD_LDAP_VERIFY_CERT,
@@ -1398,6 +1407,9 @@ async def list_blocked_devices(request: Request) -> JSONResponse:
 
 @app.post("/refresh/devices")
 async def refresh_devices() -> JSONResponse:
+    if not GRAPH_ENABLED:
+        return JSONResponse({"ok": False, "error": "GRAPH_ENABLED is false"}, status_code=400)
+
     try:
         result = await refresh_device_cache_once()
         return JSONResponse(result, status_code=200)
@@ -1407,6 +1419,9 @@ async def refresh_devices() -> JSONResponse:
 
 @app.post("/refresh/users")
 async def refresh_users() -> JSONResponse:
+    if not GRAPH_ENABLED:
+        return JSONResponse({"ok": False, "error": "GRAPH_ENABLED is false"}, status_code=400)
+
     try:
         result = await refresh_user_cache_once()
         return JSONResponse(result, status_code=200)
@@ -1507,16 +1522,23 @@ async def check(request: Request) -> JSONResponse:
 
     entra_device_id = identity.get("entra_device_id")
     user_upn = identity.get("user_upn")
+    onprem_sid_early = identity.get("onprem_sid")
     cert_type = "user" if user_upn or identity.get("entra_user_id") else "device"
     checks["certType"] = cert_type
 
-    if not entra_device_id and not user_upn:
+    if GRAPH_ENABLED:
+        has_identity = bool(entra_device_id or user_upn)
+    else:
+        # AD-only mode: Graph identifiers are never resolved, so an AD onprem-sid
+        # is enough to proceed to the AD/policy check instead of requiring one.
+        has_identity = bool(entra_device_id or user_upn or onprem_sid_early)
+
+    if not has_identity:
         event = reject_event("certificate does not contain expected URN identity", checks)
         log_event(event)
         await postgres_log_auth_event(event)
         return JSONResponse(event, status_code=403)
 
-    onprem_sid_early = identity.get("onprem_sid")
     blocked = await is_device_blocked(entra_device_id=entra_device_id or "", onprem_sid=onprem_sid_early or "")
     if blocked:
         event = reject_event(f"device blocked: {blocked.get('reason') or 'no reason given'}", checks)
@@ -1528,11 +1550,11 @@ async def check(request: Request) -> JSONResponse:
     user_result = None
     ad_device_result = None
 
-    if entra_device_id:
+    if GRAPH_ENABLED and entra_device_id:
         device_result = await check_device(entra_device_id)
         checks["device"] = device_result
 
-    if user_upn:
+    if GRAPH_ENABLED and user_upn:
         user_result = await check_user(user_upn)
         checks["user"] = user_result
 
