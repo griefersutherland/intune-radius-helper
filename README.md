@@ -252,8 +252,12 @@ donations. A few of my own favorites:
 - [KDE](https://kde.org/donate/)
 - [ReactOS](https://reactos.org/donate/)
 - [Matrix.org](https://donorbox.org/keep-matrix-exciting) — a free-speech,
-  end-to-end encrypted chat protocol, which feels especially important to
-  keep funded right now
+  end-to-end encrypted chat protocol
+- [LLVM](https://github.com/sponsors/llvm) — the compiler infrastructure
+  underneath a huge share of modern software
+
+Both feel especially important to keep funded right now, in these
+uncertain times of dark enlightenment.
 
 And if you'd like to help cover this project's own Anthropic API usage, or
 support a personal local-inference homelab, that's separate and entirely
