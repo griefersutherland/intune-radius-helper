@@ -25,7 +25,7 @@ checks Intune `managedDevices` compliance and Entra account status via
 Microsoft Graph, evaluates a declarative JSON policy against those facts to
 pick a tier (`access` / `untrust` / `reject`), and returns `200` (access) or
 `403` (untrust or reject) accordingly.
-[intune-radius-stack](https://github.com/griefersutherland/intune-radius-stack)
+[mid-radius-stack](https://github.com/griefersutherland/mid-radius-stack)
 calls it from RADIUS's `post-auth` phase rather than the EAP-TLS
 `verify { client = ... }` hook specifically so a non-`access` tier can still
 land on a different VLAN instead of only ever being able to reject outright.
@@ -72,7 +72,7 @@ Returns:
 return HTTP `403` (`allow: false`) at this endpoint - the distinction between
 them is carried in the `tier` field of the response body, not the status
 code. See "Policy engine" below and
-[intune-radius-stack](https://github.com/griefersutherland/intune-radius-stack)'s
+[mid-radius-stack](https://github.com/griefersutherland/mid-radius-stack)'s
 README for how that consumes `tier` to land `untrust` on a different VLAN
 than an outright `reject`.
 
@@ -121,7 +121,7 @@ default) - check `policyLoadError` on `/healthz`.
 `untrust` and `reject` both produce HTTP `403` from `/check` - a consumer
 that only looks at the status code can't tell them apart. FreeRADIUS's
 `verify { client = ... }` hook (see
-[intune-radius-stack](https://github.com/griefersutherland/intune-radius-stack))
+[mid-radius-stack](https://github.com/griefersutherland/mid-radius-stack))
 can't either, since a non-200 there hard-fails the TLS handshake before any
 VLAN could ever be assigned - which is why that stack's actual compliance
 check now happens later, in RADIUS's `post-auth` phase, where it can read
