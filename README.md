@@ -242,3 +242,19 @@ certificate verify script.
 ## License
 
 GPLv3 or later. See [LICENSE](LICENSE).
+
+## Support open source
+
+If this project was useful to you, consider donating to an open-source
+project you rely on — most of them run on volunteer time and small
+donations. A few of my own favorites:
+
+- [KDE](https://kde.org/donate/)
+- [ReactOS](https://reactos.org/donate/)
+- [Matrix.org](https://donorbox.org/keep-matrix-exciting) — a free-speech,
+  end-to-end encrypted chat protocol, which feels especially important to
+  keep funded right now
+
+And if you'd like to help cover this project's own Anthropic API usage, or
+support a personal local-inference homelab, that's separate and entirely
+optional: [GoFundMe](https://gofund.me/815bb9c26)
