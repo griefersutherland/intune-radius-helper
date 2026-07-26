@@ -1646,6 +1646,10 @@ async def debug_ad_device(request: Request) -> JSONResponse:
     """Bypasses the cache to test the live AD/LDAPS device lookup directly -
     for confirming connectivity/bind/base-DN/filter against a real DC without
     waiting for an actual RADIUS auth or going through /check's caching."""
+    auth_error = require_admin_api_key(request)
+    if auth_error:
+        return auth_error
+
     if not AD_LDAP_ENABLED:
         return JSONResponse({"ok": False, "error": "AD_LDAP_ENABLED is false"}, status_code=400)
 
@@ -1667,6 +1671,10 @@ async def debug_jamf_device(request: Request) -> JSONResponse:
     for confirming connectivity/auth/group ID against a real Jamf Pro
     instance without waiting for an actual RADIUS auth or going through
     /check's caching."""
+    auth_error = require_admin_api_key(request)
+    if auth_error:
+        return auth_error
+
     if not JAMF_ENABLED:
         return JSONResponse({"ok": False, "error": "JAMF_ENABLED is false"}, status_code=400)
 

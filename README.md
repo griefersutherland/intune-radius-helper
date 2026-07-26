@@ -93,7 +93,10 @@ runs a live AD/LDAPS lookup directly - bypassing the cache and `/check`'s
 policy evaluation entirely - for testing connectivity/bind/base-DN/filter
 against a real DC (only works when `AD_LDAP_ENABLED=true`). `POST
 /debug/jamf-device` (`{"serial": "C02ZC2QYLVDL"}`) does the same for a live
-Jamf Pro inventory lookup (only works when `JAMF_ENABLED=true`).
+Jamf Pro inventory lookup (only works when `JAMF_ENABLED=true`). Both
+`/debug/*` endpoints require `X-Admin-Api-Key` - see "Device blocking"
+below for the same auth mechanism and its fail-closed behavior with no key
+configured.
 
 ## Policy engine
 
@@ -230,7 +233,7 @@ running container, without needing a real cert or RADIUS auth attempt:
 
 ```bash
 curl -X POST http://localhost:8080/debug/ad-device \
-  -H "Content-Type: application/json" \
+  -H "X-Admin-Api-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"onprem_sid": "S-1-5-21-..."}'
 ```
 
@@ -288,7 +291,7 @@ attempt:
 
 ```bash
 curl -X POST http://localhost:8080/debug/jamf-device \
-  -H "Content-Type: application/json" \
+  -H "X-Admin-Api-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"serial": "C02ZC2QYLVDL"}'
 ```
 
@@ -320,8 +323,9 @@ An explicit denylist, independent of Intune/Entra compliance and the policy
 engine above - for immediately cutting off a stolen/terminated device
 regardless of what Graph or AD currently reports about it. Requires
 `CACHE_BACKEND=postgres_redis` (backed by a `blocked_devices` table) and
-`ADMIN_API_KEY` set - with no key configured, the endpoints below refuse
-every request rather than accept unauthenticated writes.
+`ADMIN_API_KEY` set - with no key configured, the endpoints below (and the
+`/debug/*` endpoints above) refuse every request rather than accept
+unauthenticated access.
 
 A block is checked live (never cached) on every `/check` call, and short-circuits
 *everything else* - including `TRUST_CHAIN_FALLBACK` and the declarative
@@ -361,7 +365,7 @@ including:
 - Optional Jamf Pro (`JAMF_*`) - see "Jamf Pro device lookup" above
 - Cache backend: `sqlite` (single file, zero external dependencies) or
   `postgres_redis` (for multi-replica / higher-throughput deployments)
-- Device blocking (`ADMIN_API_KEY`) - see "Device blocking" above
+- Device blocking and `/debug/*` endpoint auth (`ADMIN_API_KEY`) - see "Device blocking" above
 
 ## Running
 
