@@ -107,6 +107,21 @@ to a flat set of **facts**:
 | `jamf_serial_present_in_cert` | whether the cert's SAN URIs carried a `jamf-serial` |
 | `jamf_device_found` / `jamf_device_managed` / `jamf_compliant_group_member` / `jamf_last_contact_age_hours` | Jamf Pro lookup result, only populated when `JAMF_ENABLED=true` (see below) - otherwise `false`/`null` |
 
+On top of those platform-specific facts, a second layer of **normalized**
+facts collapses whichever platform actually resolved for a given cert into a
+shared vocabulary, so one ruleset can express "compliant → access, known but
+not → untrust, unknown → reject" without repeating it per platform:
+
+| Fact | Meaning |
+|---|---|
+| `identity_platform` | `"intune"`, `"jamf"`, or `"unresolved"` - which check path populated data for this cert |
+| `identity_found` | normalized `device_found`/`jamf_device_found`/`user_found`, whichever platform matched |
+| `compliant` | `true`/`false`, or `null` if no compliance signal applies (e.g. a bare user cert, or nothing found) - Intune: `compliance_state == "compliant"`; Jamf: managed **and** a member of the compliant Smart Group |
+| `last_checkin_age_hours` | normalized `last_sync_age_hours`/`jamf_last_contact_age_hours` |
+| `account_enabled` | normalized `device_account_enabled`/`user_account_enabled`/Jamf `managed`, collapsed to `false` if *any* populated signal is `false` |
+
+**AD/LDAP is deliberately excluded from `compliant`/`account_enabled`** - on-prem AD has no compliance concept, just enabled/disabled, which isn't the same axis as "out of compliance." It stays a separate, additive check (`ad_device_found`/`ad_device_enabled`) that a custom rule can still act on.
+
 Rules are an ordered list, evaluated first-match-wins; falling off the end
 uses `defaultTier` (fail-closed: `reject`). A rule's `when` is a condition
 tree: `{"field": ..., "op": ..., "value": ...}` leaves (`op` one of `eq`,
@@ -114,14 +129,19 @@ tree: `{"field": ..., "op": ..., "value": ...}` leaves (`op` one of `eq`,
 / `{"any": [...]}` / `{"not": ...}`.
 
 [`policy.example.json`](policy.example.json) documents the format and
-reproduces the built-in default ruleset (compliant device → `access`; known
-but non-compliant device → `untrust`; disabled user/device, an unresolved
-user identity, or a user cert missing its required device pairing → `reject`;
-anything else → `reject` via `defaultTier`). Copy it, edit it, and mount it at
-`POLICY_RULES_FILE` (default `/config/policy.json`) to override the default -
-if that path doesn't exist, the built-in default ruleset above is used as-is,
-and if it exists but fails to parse, **every request is rejected** (loud and
-fail-closed, rather than silently falling back to a maybe-more-permissive
+reproduces the built-in default ruleset, which is built on the normalized
+facts above - compliant device (Intune **or** Jamf) → `access`; known but
+non-compliant → `untrust`; disabled/unmanaged account, an unresolved user
+identity, or a user cert missing its required device pairing → `reject`;
+anything else → `reject` via `defaultTier`. This means a fresh deployment
+with `JAMF_ENABLED=true` gets correct compliance-gated behavior for both
+Intune and Jamf devices with **no custom `policy.json` needed at all**. Copy
+`policy.example.json`, edit it, and mount it at `POLICY_RULES_FILE` (default
+`/config/policy.json`) only once you need to diverge from the default - e.g.
+different staleness thresholds per platform, or acting on the AD facts. If
+`POLICY_RULES_FILE` doesn't exist, the built-in default ruleset above is used
+as-is, and if it exists but fails to parse, **every request is rejected**
+(loud and fail-closed, rather than silently falling back to a maybe-more-permissive
 default) - check `policyLoadError` on `/healthz`.
 
 `untrust` and `reject` both produce HTTP `403` from `/check` - a consumer
@@ -215,13 +235,15 @@ client-credentials against `{JAMF_API_URL}/api/oauth/token`.
 
 This populates `jamf_device_found`, `jamf_device_managed` (Jamf's
 "actively MDM-managed" flag), `jamf_compliant_group_member`, and
-`jamf_last_contact_age_hours`, but **does not change any decision by
-itself** - the built-in default ruleset doesn't reference these facts. To
-act on them, add rules to your `policy.json` - see
-[`policy.jamf.example.json`](policy.jamf.example.json) for a ready-to-copy
-ruleset (device not found → reject; found but unmanaged → reject; stale
-check-in → untrust; managed + compliant-group member → access; otherwise
-untrust).
+`jamf_last_contact_age_hours`. Unlike the AD facts, **these do change the
+decision out of the box** - the built-in default ruleset (see "Policy
+engine" above) normalizes them into the same `identity_found`/`compliant`/
+`account_enabled` facts the Intune path uses, so `JAMF_ENABLED=true` alone
+gets you correct compliant → `access` / non-compliant → `untrust` /
+unmanaged or not-found → `reject` behavior with no `policy.json` needed at
+all. Only write a custom `policy.json` if you need to diverge from that
+(different staleness threshold than Intune's, Jamf capped at `untrust` even
+when compliant, etc.).
 
 Jamf lookups are cached the same way as Graph/AD lookups (subject to
 `LOCAL_CACHE_FIRST`, `ALLOW_STALE_CACHE_ON_GRAPH_ERROR`, and

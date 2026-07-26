@@ -774,30 +774,24 @@ DEFAULT_POLICY: dict[str, Any] = {
             "reason": "user certificate identity could not be resolved against Entra",
         },
         {
-            "name": "disabled-user-reject",
-            "when": {"field": "user_account_enabled", "op": "eq", "value": False},
+            "name": "account-disabled-reject",
+            "when": {"field": "account_enabled", "op": "eq", "value": False},
             "tier": "reject",
-            "reason": "user account disabled",
+            "reason": "account disabled or device unmanaged",
         },
         {
-            "name": "disabled-device-reject",
-            "when": {"field": "device_account_enabled", "op": "eq", "value": False},
-            "tier": "reject",
-            "reason": "device account disabled",
-        },
-        {
-            "name": "compliant-device-access",
+            "name": "compliant-access",
             "when": {"all": [
-                {"field": "device_found", "op": "eq", "value": True},
-                {"field": "compliance_state", "op": "eq", "value": "compliant"},
-                {"field": "last_sync_age_hours", "op": "lte", "value": 72},
+                {"field": "identity_found", "op": "eq", "value": True},
+                {"field": "compliant", "op": "eq", "value": True},
+                {"field": "last_checkin_age_hours", "op": "lte", "value": 72},
             ]},
             "tier": "access",
             "reason": "device compliant",
         },
         {
-            "name": "known-noncompliant-device-untrust",
-            "when": {"field": "device_found", "op": "eq", "value": True},
+            "name": "known-noncompliant-untrust",
+            "when": {"field": "identity_found", "op": "eq", "value": True},
             "tier": "untrust",
             "reason": "device enrolled but not compliant",
         },
@@ -903,6 +897,11 @@ def build_facts(
         "jamf_device_managed": None,
         "jamf_last_contact_age_hours": None,
         "jamf_compliant_group_member": False,
+        "identity_platform": "unresolved",
+        "identity_found": False,
+        "compliant": None,
+        "last_checkin_age_hours": None,
+        "account_enabled": None,
     }
 
     if device_result is not None:
@@ -927,6 +926,48 @@ def build_facts(
         facts["jamf_device_managed"] = jamf_device_result.get("managed")
         facts["jamf_last_contact_age_hours"] = age_hours(jamf_device_result.get("lastContactTime"))
         facts["jamf_compliant_group_member"] = bool(jamf_device_result.get("compliantGroupMember"))
+
+    # Normalized, cross-platform facts - let one ruleset express "compliant ->
+    # access, known-but-not -> untrust, unknown -> reject" without repeating
+    # it per platform. Deliberately excludes AD/LDAP: on-prem AD has no
+    # compliance concept, just enabled/disabled, which isn't the same axis -
+    # ad_device_found/ad_device_enabled stay a separate, additive check.
+    # Platform-specific facts above are untouched, so existing custom
+    # policy.json files keep working unmodified.
+    if jamf_device_result is not None:
+        facts["identity_platform"] = "jamf"
+        facts["identity_found"] = facts["jamf_device_found"]
+        facts["compliant"] = (
+            bool(facts["jamf_device_managed"]) and bool(facts["jamf_compliant_group_member"])
+            if facts["jamf_device_found"] else None
+        )
+        facts["last_checkin_age_hours"] = facts["jamf_last_contact_age_hours"]
+    elif device_result is not None:
+        facts["identity_platform"] = "intune"
+        facts["identity_found"] = facts["device_found"]
+        facts["compliant"] = (
+            facts["compliance_state"] == "compliant" if facts["device_found"] else None
+        )
+        facts["last_checkin_age_hours"] = facts["last_sync_age_hours"]
+    elif user_result is not None:
+        facts["identity_platform"] = "intune"
+        facts["identity_found"] = facts["user_found"]
+        facts["compliant"] = None
+        facts["last_checkin_age_hours"] = None
+    else:
+        facts["identity_platform"] = "unresolved"
+        facts["identity_found"] = False
+        facts["compliant"] = None
+        facts["last_checkin_age_hours"] = None
+
+    enabled_signals = []
+    if device_result is not None and facts["device_account_enabled"] is not None:
+        enabled_signals.append(facts["device_account_enabled"])
+    if user_result is not None and facts["user_account_enabled"] is not None:
+        enabled_signals.append(facts["user_account_enabled"])
+    if jamf_device_result is not None and facts["jamf_device_managed"] is not None:
+        enabled_signals.append(facts["jamf_device_managed"])
+    facts["account_enabled"] = all(enabled_signals) if enabled_signals else None
 
     return facts
 
