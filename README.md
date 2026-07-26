@@ -39,11 +39,13 @@ The client certificate must carry one or more SAN URIs of the form:
 <URN_PREFIX>:user-upn:<user principal name>
 <URN_PREFIX>:entra-user-id:<entra object id>
 <URN_PREFIX>:onprem-sid:<on-prem AD objectSid, e.g. via Intune SCEP's {{OnPremisesSecurityIdentifier}}>
+<URN_PREFIX>:jamf-serial:<device serial number, e.g. via a Jamf SCEP profile's $SERIALNUMBER>
 ```
 
 `URN_PREFIX` is configurable (e.g. `urn:example.com`). The `onprem-sid` URI is
-only consumed when `AD_LDAP_ENABLED=true` (see "Policy engine" and
-"Configuration" below) - it's ignored otherwise.
+only consumed when `AD_LDAP_ENABLED=true`, and `jamf-serial` only when
+`JAMF_ENABLED=true` (see "Policy engine" and "Configuration" below) - both are
+ignored otherwise.
 
 ## Request / response contract
 
@@ -82,7 +84,9 @@ than an outright `reject`.
 cache refresh. `POST /debug/ad-device` (`{"onprem_sid": "S-1-5-21-..."}`)
 runs a live AD/LDAPS lookup directly - bypassing the cache and `/check`'s
 policy evaluation entirely - for testing connectivity/bind/base-DN/filter
-against a real DC (only works when `AD_LDAP_ENABLED=true`).
+against a real DC (only works when `AD_LDAP_ENABLED=true`). `POST
+/debug/jamf-device` (`{"serial": "C02ZC2QYLVDL"}`) does the same for a live
+Jamf Pro inventory lookup (only works when `JAMF_ENABLED=true`).
 
 ## Policy engine
 
@@ -100,6 +104,8 @@ to a flat set of **facts**:
 | `device_account_enabled` / `user_account_enabled` | Entra `accountEnabled` |
 | `onprem_sid_present_in_cert` | whether the cert's SAN URIs carried an `onprem-sid` |
 | `ad_device_found` / `ad_device_enabled` | on-prem AD lookup result, only populated when `AD_LDAP_ENABLED=true` (see below) - otherwise `false`/`null` |
+| `jamf_serial_present_in_cert` | whether the cert's SAN URIs carried a `jamf-serial` |
+| `jamf_device_found` / `jamf_device_managed` / `jamf_compliant_group_member` / `jamf_last_contact_age_hours` | Jamf Pro lookup result, only populated when `JAMF_ENABLED=true` (see below) - otherwise `false`/`null` |
 
 Rules are an ordered list, evaluated first-match-wins; falling off the end
 uses `defaultTier` (fail-closed: `reject`). A rule's `when` is a condition
@@ -179,6 +185,62 @@ This calls the live LDAP lookup directly (bypassing the cache), so a
 connectivity, bind, or filter problem shows up immediately in the response's
 `_ldapError` rather than being masked by a stale cache entry.
 
+### Jamf Pro device lookup (optional)
+
+For Jamf-managed devices (typically macOS, not enrolled in Intune) - set
+`JAMF_ENABLED=true` (plus `JAMF_API_URL`, `JAMF_API_CLIENT_ID`,
+`JAMF_API_CLIENT_SECRET`, `JAMF_COMPLIANT_GROUP_ID`) to have `/check` also
+query Jamf Pro for the device's inventory record and Smart Group
+memberships, matched against the cert's `jamf-serial` SAN URI:
+
+| Type | Value |
+|---|---|
+| URI | `urn:example.com:jamf-serial:{{SERIALNUMBER}}` |
+
+(If certs come from [pimptune-stack](https://github.com/griefersutherland/pimptune-stack)'s
+Jamf SCEP provisioner, add this URI in the same SCEP profile's Subject
+Alternative Name section documented in that repo's README.)
+
+Jamf Pro has no single `complianceState` field the way Intune's
+`managedDevices` does - "compliant" here means membership in a **Smart
+Group you define yourself** in Jamf Pro (e.g. one built from Smart Group
+criteria like FileVault status, OS version, or a compliance Extension
+Attribute). `JAMF_COMPLIANT_GROUP_ID` is that group's numeric ID, visible in
+the group's URL in the Jamf Pro console (`.../smartComputerGroups.html?id=42`
+→ `42`).
+
+The API Client (Jamf Pro → Settings → System → API roles and clients) needs
+read access to computer inventory and group memberships; auth is OAuth
+client-credentials against `{JAMF_API_URL}/api/oauth/token`.
+
+This populates `jamf_device_found`, `jamf_device_managed` (Jamf's
+"actively MDM-managed" flag), `jamf_compliant_group_member`, and
+`jamf_last_contact_age_hours`, but **does not change any decision by
+itself** - the built-in default ruleset doesn't reference these facts. To
+act on them, add rules to your `policy.json` - see
+[`policy.jamf.example.json`](policy.jamf.example.json) for a ready-to-copy
+ruleset (device not found → reject; found but unmanaged → reject; stale
+check-in → untrust; managed + compliant-group member → access; otherwise
+untrust).
+
+Jamf lookups are cached the same way as Graph/AD lookups (subject to
+`LOCAL_CACHE_FIRST`, `ALLOW_STALE_CACHE_ON_GRAPH_ERROR`, and
+`MAX_STALE_CACHE_HOURS`).
+
+Test connectivity/auth/group-ID against your real Jamf Pro instance directly
+through the running container, without needing a real cert or RADIUS auth
+attempt:
+
+```bash
+curl -X POST http://localhost:8080/debug/jamf-device \
+  -H "Content-Type: application/json" \
+  -d '{"serial": "C02ZC2QYLVDL"}'
+```
+
+This calls the live Jamf Pro lookup directly (bypassing the cache), so an
+auth or filter problem shows up immediately in the response's `_jamfError`
+rather than being masked by a stale cache entry.
+
 ### AD-only mode (no Graph app registration)
 
 Set `GRAPH_ENABLED=false` to skip Microsoft Graph entirely - no token
@@ -210,12 +272,12 @@ A block is checked live (never cached) on every `/check` call, and short-circuit
 *everything else* - including `TRUST_CHAIN_FALLBACK` and the declarative
 policy engine - so it can't be bypassed by a custom `policy.json`. It's
 checked once by MAC (`Calling-Station-Id`) before the certificate is even
-parsed, and again by Entra device ID / AD SID once the cert identity is
-extracted, so a block still applies across a NIC swap if the identity in the
-cert is what's blocked.
+parsed, and again by Entra device ID / AD SID / Jamf serial once the cert
+identity is extracted, so a block still applies across a NIC swap if the
+identity in the cert is what's blocked.
 
 ```bash
-# block (identifier_type is one of: mac, entra_device_id, ad_sid)
+# block (identifier_type is one of: mac, entra_device_id, ad_sid, jamf_serial)
 curl -X POST http://localhost:8080/block-device \
   -H "X-Admin-Api-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"identifier_type": "mac", "identifier_value": "aa:bb:cc:dd:ee:ff", "reason": "reported stolen"}'
@@ -241,6 +303,7 @@ including:
   `GRAPH_ENABLED` to disable Graph entirely - see "AD-only mode" above
 - Policy (`POLICY_RULES_FILE`, `TRUST_CHAIN_FALLBACK`) - see "Policy engine" above
 - Optional AD/LDAP (`AD_LDAP_*`) - see "On-prem AD device lookup" above
+- Optional Jamf Pro (`JAMF_*`) - see "Jamf Pro device lookup" above
 - Cache backend: `sqlite` (single file, zero external dependencies) or
   `postgres_redis` (for multi-replica / higher-throughput deployments)
 - Device blocking (`ADMIN_API_KEY`) - see "Device blocking" above

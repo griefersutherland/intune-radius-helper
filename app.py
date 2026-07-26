@@ -86,6 +86,18 @@ AD_LDAP_BIND_PASSWORD = os.getenv("AD_LDAP_BIND_PASSWORD", "")
 AD_LDAP_BASE_DN = os.getenv("AD_LDAP_BASE_DN", "")
 AD_LDAP_TIMEOUT_SECONDS = env_int("AD_LDAP_TIMEOUT_SECONDS", 10)
 
+# Optional Jamf Pro device lookup, keyed off the cert's jamf-serial SAN URI
+# (see README's "Jamf Pro device lookup" section). Jamf has no single
+# complianceState field like Intune's - "compliant" here means membership in
+# a Smart Group you define in Jamf Pro yourself; JAMF_COMPLIANT_GROUP_ID is
+# that group's numeric ID (visible in its URL in the Jamf Pro console).
+JAMF_ENABLED = env_bool("JAMF_ENABLED", False)
+JAMF_API_URL = os.getenv("JAMF_API_URL", "").rstrip("/")
+JAMF_API_CLIENT_ID = os.getenv("JAMF_API_CLIENT_ID", "")
+JAMF_API_CLIENT_SECRET = os.getenv("JAMF_API_CLIENT_SECRET", "")
+JAMF_COMPLIANT_GROUP_ID = os.getenv("JAMF_COMPLIANT_GROUP_ID", "")
+JAMF_API_TIMEOUT_SECONDS = env_int("JAMF_API_TIMEOUT_SECONDS", 20)
+
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 CACHE_BACKEND = os.getenv("CACHE_BACKEND", "sqlite").strip().lower()
@@ -122,6 +134,10 @@ pg_pool: Optional[asyncpg.Pool] = None
 
 memory_cache: dict[str, dict[str, Any]] = {}
 token_cache: dict[str, Any] = {
+    "access_token": None,
+    "expires_at": 0,
+}
+jamf_token_cache: dict[str, Any] = {
     "access_token": None,
     "expires_at": 0,
 }
@@ -447,7 +463,7 @@ async def postgres_log_auth_event(event: dict[str, Any]) -> None:
         )
 
 
-BLOCK_IDENTIFIER_TYPES = ("mac", "entra_device_id", "ad_sid")
+BLOCK_IDENTIFIER_TYPES = ("mac", "entra_device_id", "ad_sid", "jamf_serial")
 
 
 def normalize_mac(value: str) -> str:
@@ -455,7 +471,7 @@ def normalize_mac(value: str) -> str:
 
 
 async def is_device_blocked(
-    mac: str = "", entra_device_id: str = "", onprem_sid: str = ""
+    mac: str = "", entra_device_id: str = "", onprem_sid: str = "", jamf_serial: str = ""
 ) -> Optional[dict[str, Any]]:
     # Device blocking is a Postgres-backed override, checked live (never
     # cached) so a block takes effect on the very next request - not
@@ -470,6 +486,8 @@ async def is_device_blocked(
         identifiers.append(("entra_device_id", entra_device_id))
     if onprem_sid:
         identifiers.append(("ad_sid", onprem_sid))
+    if jamf_serial:
+        identifiers.append(("jamf_serial", jamf_serial))
     if not identifiers:
         return None
 
@@ -564,6 +582,41 @@ async def graph_get(path_or_url: str, params: Optional[dict[str, Any]] = None) -
     raise RuntimeError(json.dumps(last_error))
 
 
+async def jamf_token() -> str:
+    if jamf_token_cache["access_token"] and jamf_token_cache["expires_at"] > time.time() + 60:
+        return jamf_token_cache["access_token"]
+
+    url = f"{JAMF_API_URL}/api/oauth/token"
+    data = {
+        "client_id": JAMF_API_CLIENT_ID,
+        "client_secret": JAMF_API_CLIENT_SECRET,
+        "grant_type": "client_credentials",
+    }
+
+    async with httpx.AsyncClient(timeout=JAMF_API_TIMEOUT_SECONDS) as client:
+        response = await client.post(url, data=data)
+        response.raise_for_status()
+        body = response.json()
+
+    jamf_token_cache["access_token"] = body["access_token"]
+    jamf_token_cache["expires_at"] = time.time() + int(body.get("expires_in", 900))
+    return jamf_token_cache["access_token"]
+
+
+async def jamf_get(path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    token = await jamf_token()
+    url = f"{JAMF_API_URL}{path}"
+
+    async with httpx.AsyncClient(timeout=JAMF_API_TIMEOUT_SECONDS) as client:
+        response = await client.get(
+            url,
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
 def openssl_cert_text(cert_pem: str) -> str:
     with tempfile.NamedTemporaryFile("w", delete=False) as f:
         f.write(cert_pem)
@@ -605,11 +658,13 @@ def extract_identity(cert_pem: str) -> dict[str, Any]:
     user_upn = None
     entra_user_id = None
     onprem_sid = None
+    jamf_serial = None
 
     device_prefix = f"{URN_PREFIX}:entra-device-id:"
     upn_prefix = f"{URN_PREFIX}:user-upn:"
     user_id_prefix = f"{URN_PREFIX}:entra-user-id:"
     onprem_sid_prefix = f"{URN_PREFIX}:onprem-sid:"
+    jamf_serial_prefix = f"{URN_PREFIX}:jamf-serial:"
 
     for uri in uris:
         if uri.startswith(device_prefix):
@@ -620,12 +675,15 @@ def extract_identity(cert_pem: str) -> dict[str, Any]:
             entra_user_id = uri[len(user_id_prefix):].strip().lower()
         elif uri.startswith(onprem_sid_prefix):
             onprem_sid = uri[len(onprem_sid_prefix):].strip()
+        elif uri.startswith(jamf_serial_prefix):
+            jamf_serial = uri[len(jamf_serial_prefix):].strip()
 
     return {
         "entra_device_id": entra_device_id,
         "user_upn": user_upn,
         "entra_user_id": entra_user_id,
         "onprem_sid": onprem_sid,
+        "jamf_serial": jamf_serial,
         "emails": emails,
         "uris": uris,
     }
@@ -654,6 +712,30 @@ def evaluate_managed_device(managed: dict[str, Any], entra_device: Optional[dict
         "managementAgent": managed.get("managementAgent"),
         "operatingSystem": managed.get("operatingSystem"),
         "entraDevice": entra_device,
+        "fetched_at": iso_now(),
+    }
+
+
+def evaluate_jamf_device(computer: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a Jamf Pro computers-inventory item into cache-friendly fields.
+
+    Carries no allow/deny opinion - that decision is made by the policy engine
+    from the facts this produces, at request time (see build_facts/evaluate_policy).
+    "Compliant" is membership in JAMF_COMPLIANT_GROUP_ID, since Jamf has no
+    single complianceState field the way Intune's managedDevices does.
+    """
+    general = computer.get("general") or {}
+    remote_management = general.get("remoteManagement") or {}
+    group_memberships = computer.get("groupMemberships") or []
+    group_ids = [g.get("groupId") for g in group_memberships if g.get("groupId")]
+
+    return {
+        "id": computer.get("id"),
+        "serialNumber": (computer.get("hardware") or {}).get("serialNumber"),
+        "managed": remote_management.get("managed"),
+        "lastContactTime": general.get("lastContactTime"),
+        "groupIds": group_ids,
+        "compliantGroupMember": bool(JAMF_COMPLIANT_GROUP_ID) and JAMF_COMPLIANT_GROUP_ID in group_ids,
         "fetched_at": iso_now(),
     }
 
@@ -801,12 +883,14 @@ def build_facts(
     device_result: Optional[dict[str, Any]],
     user_result: Optional[dict[str, Any]],
     ad_device_result: Optional[dict[str, Any]] = None,
+    jamf_device_result: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     facts: dict[str, Any] = {
         "cert_type": cert_type,
         "device_id_present_in_cert": bool(identity.get("entra_device_id")),
         "user_upn_present_in_cert": bool(identity.get("user_upn")),
         "onprem_sid_present_in_cert": bool(identity.get("onprem_sid")),
+        "jamf_serial_present_in_cert": bool(identity.get("jamf_serial")),
         "device_found": False,
         "compliance_state": None,
         "last_sync_age_hours": None,
@@ -815,6 +899,10 @@ def build_facts(
         "user_account_enabled": None,
         "ad_device_found": False,
         "ad_device_enabled": None,
+        "jamf_device_found": False,
+        "jamf_device_managed": None,
+        "jamf_last_contact_age_hours": None,
+        "jamf_compliant_group_member": False,
     }
 
     if device_result is not None:
@@ -833,6 +921,12 @@ def build_facts(
     if ad_device_result is not None:
         facts["ad_device_found"] = bool(ad_device_result.get("found"))
         facts["ad_device_enabled"] = ad_device_result.get("accountEnabled")
+
+    if jamf_device_result is not None:
+        facts["jamf_device_found"] = bool(jamf_device_result.get("id"))
+        facts["jamf_device_managed"] = jamf_device_result.get("managed")
+        facts["jamf_last_contact_age_hours"] = age_hours(jamf_device_result.get("lastContactTime"))
+        facts["jamf_compliant_group_member"] = bool(jamf_device_result.get("compliantGroupMember"))
 
     return facts
 
@@ -1104,6 +1198,69 @@ async def check_ad_device(onprem_sid: str) -> dict[str, Any]:
         }
 
 
+async def live_jamf_device_lookup(serial: str) -> dict[str, Any]:
+    response = await jamf_get(
+        "/api/v1/computers-inventory",
+        params={
+            "filter": f'hardware.serialNumber=="{serial}"',
+            "section": "GENERAL,GROUP_MEMBERSHIPS",
+        },
+    )
+
+    results = response.get("results", [])
+    if not results:
+        return {
+            "reason": "device not found in Jamf Pro inventory",
+            "serialNumber": serial,
+            "fetched_at": iso_now(),
+        }
+
+    result = evaluate_jamf_device(results[0])
+    result["_decisionSource"] = "live_jamf"
+    return result
+
+
+async def check_jamf_device(serial: str) -> dict[str, Any]:
+    cache_key = f"jamf_device:{serial.lower()}"
+
+    mem = memory_get(cache_key)
+    if mem:
+        return mem
+
+    cached = await cache_get(cache_key)
+
+    if LOCAL_CACHE_FIRST and cached and is_fresh(cached.get("fetched_at"), LOCAL_CACHE_MAX_AGE_SECONDS):
+        data = dict(cached["data"])
+        data["_decisionSource"] = "local_cache"
+        memory_set(cache_key, data)
+        return data
+
+    try:
+        result = await live_jamf_device_lookup(serial)
+        await cache_set(cache_key, "jamf_device", serial.lower(), result)
+        memory_set(cache_key, result)
+        return result
+    except Exception as exc:
+        jamf_error = {
+            "message": str(exc),
+        }
+
+        if ALLOW_STALE_CACHE_ON_GRAPH_ERROR and cached and is_stale_usable(cached.get("fetched_at")):
+            data = dict(cached["data"])
+            data["_decisionSource"] = "stale_persistent_cache"
+            data["_jamfError"] = jamf_error
+            memory_set(cache_key, data)
+            return data
+
+        return {
+            "reason": "Jamf Pro lookup failed and no usable cache exists",
+            "serialNumber": serial.lower(),
+            "_decisionSource": "jamf_error_no_cache",
+            "_jamfError": jamf_error,
+            "fetched_at": iso_now(),
+        }
+
+
 async def refresh_device_cache_once() -> dict[str, Any]:
     count = 0
     next_url = None
@@ -1288,6 +1445,9 @@ async def healthz() -> dict[str, Any]:
         "adLdapEnabled": AD_LDAP_ENABLED,
         "adLdapServer": AD_LDAP_SERVER if AD_LDAP_ENABLED else None,
         "adLdapVerifyCert": AD_LDAP_VERIFY_CERT,
+        "jamfEnabled": JAMF_ENABLED,
+        "jamfApiUrl": JAMF_API_URL if JAMF_ENABLED else None,
+        "jamfCompliantGroupIdConfigured": bool(JAMF_COMPLIANT_GROUP_ID),
         "adminApiKeyConfigured": bool(ADMIN_API_KEY),
         "blockedDeviceCount": blocked_device_count,
     }
@@ -1449,6 +1609,27 @@ async def debug_ad_device(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
+@app.post("/debug/jamf-device")
+async def debug_jamf_device(request: Request) -> JSONResponse:
+    """Bypasses the cache to test the live Jamf Pro lookup directly -
+    for confirming connectivity/auth/group ID against a real Jamf Pro
+    instance without waiting for an actual RADIUS auth or going through
+    /check's caching."""
+    if not JAMF_ENABLED:
+        return JSONResponse({"ok": False, "error": "JAMF_ENABLED is false"}, status_code=400)
+
+    body = await request.json()
+    serial = body.get("serial") or body.get("serial_number") or ""
+    if not serial:
+        return JSONResponse({"ok": False, "error": "missing serial"}, status_code=400)
+
+    try:
+        result = await live_jamf_device_lookup(serial)
+        return JSONResponse({"ok": True, "result": result}, status_code=200)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
 @app.post("/check")
 async def check(request: Request) -> JSONResponse:
     body = await request.json()
@@ -1523,15 +1704,18 @@ async def check(request: Request) -> JSONResponse:
     entra_device_id = identity.get("entra_device_id")
     user_upn = identity.get("user_upn")
     onprem_sid_early = identity.get("onprem_sid")
+    jamf_serial_early = identity.get("jamf_serial")
     cert_type = "user" if user_upn or identity.get("entra_user_id") else "device"
     checks["certType"] = cert_type
 
+    jamf_identity_present = bool(JAMF_ENABLED and jamf_serial_early)
+
     if GRAPH_ENABLED:
-        has_identity = bool(entra_device_id or user_upn)
+        has_identity = bool(entra_device_id or user_upn or jamf_identity_present)
     else:
         # AD-only mode: Graph identifiers are never resolved, so an AD onprem-sid
         # is enough to proceed to the AD/policy check instead of requiring one.
-        has_identity = bool(entra_device_id or user_upn or onprem_sid_early)
+        has_identity = bool(entra_device_id or user_upn or onprem_sid_early or jamf_identity_present)
 
     if not has_identity:
         event = reject_event("certificate does not contain expected URN identity", checks)
@@ -1539,7 +1723,11 @@ async def check(request: Request) -> JSONResponse:
         await postgres_log_auth_event(event)
         return JSONResponse(event, status_code=403)
 
-    blocked = await is_device_blocked(entra_device_id=entra_device_id or "", onprem_sid=onprem_sid_early or "")
+    blocked = await is_device_blocked(
+        entra_device_id=entra_device_id or "",
+        onprem_sid=onprem_sid_early or "",
+        jamf_serial=jamf_serial_early or "",
+    )
     if blocked:
         event = reject_event(f"device blocked: {blocked.get('reason') or 'no reason given'}", checks)
         log_event(event)
@@ -1549,6 +1737,7 @@ async def check(request: Request) -> JSONResponse:
     device_result = None
     user_result = None
     ad_device_result = None
+    jamf_device_result = None
 
     if GRAPH_ENABLED and entra_device_id:
         device_result = await check_device(entra_device_id)
@@ -1563,7 +1752,12 @@ async def check(request: Request) -> JSONResponse:
         ad_device_result = await check_ad_device(onprem_sid)
         checks["adDevice"] = ad_device_result
 
-    facts = build_facts(identity, cert_type, device_result, user_result, ad_device_result)
+    jamf_serial = identity.get("jamf_serial")
+    if JAMF_ENABLED and jamf_serial:
+        jamf_device_result = await check_jamf_device(jamf_serial)
+        checks["jamfDevice"] = jamf_device_result
+
+    facts = build_facts(identity, cert_type, device_result, user_result, ad_device_result, jamf_device_result)
     checks["facts"] = facts
 
     policy = load_policy()

@@ -1,0 +1,54 @@
+{
+  "_comment": "Example policy for JAMF_ENABLED=true deployments, checking Jamf-managed devices against a Jamf Pro Smart Group instead of (or alongside) Intune/Entra. Copy this to POLICY_RULES_FILE (default /config/policy.json) and edit. Certs need a `<URN_PREFIX>:jamf-serial:{{SERIALNUMBER}}` SAN URI (see README's 'Jamf Pro device lookup' section) - jamf_device_found/jamf_device_managed/jamf_compliant_group_member/jamf_last_contact_age_hours are only populated when that URI is present and JAMF_ENABLED=true. This example treats Jamf as its own independent path (mirrors policy.ad-only.example.json's shape) - merge rules into policy.example.json instead if you want Intune and Jamf devices evaluated by the same policy file.",
+  "version": 1,
+  "defaultTier": "reject",
+  "rules": [
+    {
+      "name": "jamf-cert-missing-serial",
+      "when": {"field": "jamf_serial_present_in_cert", "op": "eq", "value": false},
+      "tier": "reject",
+      "reason": "certificate missing required jamf-serial URN"
+    },
+    {
+      "name": "jamf-device-not-found",
+      "when": {"field": "jamf_device_found", "op": "eq", "value": false},
+      "tier": "reject",
+      "reason": "device not found in Jamf Pro inventory"
+    },
+    {
+      "name": "jamf-device-unmanaged-reject",
+      "when": {"field": "jamf_device_managed", "op": "eq", "value": false},
+      "tier": "reject",
+      "reason": "device found in Jamf Pro but not actively managed (e.g. unenrolled from MDM)"
+    },
+    {
+      "name": "jamf-device-stale-untrust",
+      "when": {
+        "all": [
+          {"field": "jamf_device_found", "op": "eq", "value": true},
+          {"field": "jamf_last_contact_age_hours", "op": "gt", "value": 72}
+        ]
+      },
+      "tier": "untrust",
+      "reason": "device has not checked in with Jamf Pro in over 72 hours"
+    },
+    {
+      "name": "jamf-compliant-access",
+      "when": {
+        "all": [
+          {"field": "jamf_device_found", "op": "eq", "value": true},
+          {"field": "jamf_device_managed", "op": "eq", "value": true},
+          {"field": "jamf_compliant_group_member", "op": "eq", "value": true}
+        ]
+      },
+      "tier": "access",
+      "reason": "device managed and a member of the compliant Smart Group"
+    },
+    {
+      "name": "jamf-known-noncompliant-untrust",
+      "when": {"field": "jamf_device_found", "op": "eq", "value": true},
+      "tier": "untrust",
+      "reason": "device enrolled in Jamf Pro but not a member of the compliant Smart Group"
+    }
+  ]
+}
