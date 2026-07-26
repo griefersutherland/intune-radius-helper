@@ -54,9 +54,16 @@ POST /check
 {
   "cert_pem": "-----BEGIN CERTIFICATE-----...",
   "radius_username": "...",
-  "calling_station_id": "..."
+  "calling_station_id": "...",
+  "correlation_id": "..."
 }
 ```
+
+`correlation_id` is optional and just passed through into the response's
+`checks.correlationId` and (when `CACHE_BACKEND=postgres_redis`) the
+`auth_events` table's own `correlation_id` column - see "Correlating a
+single auth attempt across logs" below. A caller that doesn't send one just
+gets an event with no `correlationId`, same as before this existed.
 
 Returns:
 
@@ -66,7 +73,7 @@ Returns:
   "allow": true,
   "reason": "device compliant",
   "matchedRule": "compliant-device-access",
-  "checks": { "identity": {...}, "device": {...}, "user": {...}, "facts": {...} }
+  "checks": { "correlationId": "...", "identity": {...}, "device": {...}, "user": {...}, "facts": {...} }
 }
 ```
 
@@ -155,6 +162,32 @@ the `tier` field directly and land `untrust` on a different VLAN than a
 `reject`. Every `tier` decision is also visible in `/check` responses,
 `intune-auth.log`, and the `auth_events` Postgres table when
 `CACHE_BACKEND=postgres_redis`.
+
+### Correlating a single auth attempt across logs
+
+A single auth attempt touches three separate, otherwise-unlinked places:
+mid-radius-stack's `radius-verify.log` (the EAP-TLS cert verify step),
+this service's `intune-auth.log`/`/check` response (the policy decision),
+and - if `CACHE_BACKEND=postgres_redis` - the `auth_events` table. Matching
+these up by MAC address and rough timestamp works until a device retries
+several times in quick succession (routine during initial device setup,
+profile misconfiguration, or a flaky NAS) and the timestamps stop being
+unambiguous.
+
+mid-radius-stack's `verify-client-cert.sh` generates a UUID once per attempt,
+writes it into its own log line, and forwards it through `check-policy.sh`
+into this service's `/check` request as `correlation_id`. From here it's
+just carried through - into the response's `checks.correlationId`,
+`intune-auth.log`'s JSON event, and (with `CACHE_BACKEND=postgres_redis`)
+`auth_events.correlation_id`, which is indexed for direct lookup:
+
+```sql
+select * from auth_events where correlation_id = '...';
+```
+
+No configuration needed on this side - if `correlation_id` isn't sent (e.g.
+a caller other than mid-radius-stack), `checks.correlationId` is just empty,
+same as before this existed.
 
 ### On-prem AD device lookup (optional)
 

@@ -262,9 +262,19 @@ async def postgres_init() -> None:
                 cert_type text,
                 source_device text,
                 source_user text,
+                correlation_id text,
                 event_json jsonb not null
             )
             """
+        )
+        # ADD COLUMN IF NOT EXISTS rather than relying on the CREATE TABLE
+        # above - that only runs on a brand-new table, so an already-deployed
+        # auth_events table needs this to actually pick up the new column.
+        await conn.execute(
+            "alter table auth_events add column if not exists correlation_id text"
+        )
+        await conn.execute(
+            "create index if not exists idx_auth_events_correlation_id on auth_events(correlation_id)"
         )
         await conn.execute(
             """
@@ -448,9 +458,9 @@ async def postgres_log_auth_event(event: dict[str, Any]) -> None:
             """
             insert into auth_events(
               allow, reason, device_id, user_upn, cert_type,
-              source_device, source_user, event_json
+              source_device, source_user, correlation_id, event_json
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
             """,
             event.get("allow"),
             event.get("reason"),
@@ -459,6 +469,7 @@ async def postgres_log_auth_event(event: dict[str, Any]) -> None:
             checks.get("certType"),
             device.get("_decisionSource"),
             user.get("_decisionSource"),
+            checks.get("correlationId") or None,
             json.dumps(event, default=str),
         )
 
@@ -1699,9 +1710,21 @@ async def check(request: Request) -> JSONResponse:
         or ""
     )
 
+    # Threaded through from verify-client-cert.sh via check-policy.sh (see
+    # mid-radius-stack) - one ID per auth attempt, so this event and the
+    # corresponding radius-verify.log entry can be correlated directly
+    # instead of matching on MAC + rough timestamp. Optional - a caller that
+    # doesn't send one just gets an event with no correlationId, same as today.
+    correlation_id = (
+        body.get("correlation_id")
+        or body.get("correlationId")
+        or ""
+    )
+
     checks: dict[str, Any] = {
         "radiusUsername": radius_username,
         "callingStationId": calling_station_id,
+        "correlationId": correlation_id,
     }
 
     # Checked first and unconditionally - overrides TRUST_CHAIN_FALLBACK and
