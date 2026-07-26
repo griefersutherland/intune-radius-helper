@@ -1203,7 +1203,7 @@ async def live_jamf_device_lookup(serial: str) -> dict[str, Any]:
         "/api/v1/computers-inventory",
         params={
             "filter": f'hardware.serialNumber=="{serial}"',
-            "section": "GENERAL,GROUP_MEMBERSHIPS",
+            "section": "GENERAL,HARDWARE,GROUP_MEMBERSHIPS",
         },
     )
 
