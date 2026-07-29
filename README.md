@@ -42,7 +42,15 @@ The client certificate must carry one or more SAN URIs of the form:
 <URN_PREFIX>:jamf-serial:<device serial number, e.g. via a Jamf SCEP profile's $SERIALNUMBER>
 ```
 
-`URN_PREFIX` is configurable (e.g. `urn:example.com`). The `onprem-sid` URI is
+`URN_PREFIX` is configurable (e.g. `urn:example.com`). **The `onprem-sid` URI
+isn't the only way to supply this** - a cert issued directly by ADCS with
+strong certificate mapping enabled (required since [KB5014754](https://support.microsoft.com/en-us/topic/kb5014754)) carries the same
+objectSid natively as the `1.3.6.1.4.1.311.25.2` extension
+(`szOID_NTDS_CA_SECURITY_EXT`), with no custom URI at all. `extract_identity`
+checks the URI first and falls back to parsing that extension directly (DER
+per [MS-WCCE], SID bytes per [MS-DTYP] 2.4.2.2) if the URI isn't present -
+either source populates the same `onprem_sid` fact, so a real ADCS-issued
+cert works here without minting a custom URI by hand. The `onprem-sid` URI is
 only consumed when `AD_LDAP_ENABLED=true`, and `jamf-serial` only when
 `JAMF_ENABLED=true` (see "Policy engine" and "Configuration" below) - both are
 ignored otherwise.
@@ -112,7 +120,7 @@ to a flat set of **facts**:
 | `compliance_state` | Intune `complianceState`, lowercased |
 | `last_sync_age_hours` | hours since the device's last Intune sync, computed fresh per request |
 | `device_account_enabled` / `user_account_enabled` | Entra `accountEnabled` |
-| `onprem_sid_present_in_cert` | whether the cert's SAN URIs carried an `onprem-sid` |
+| `onprem_sid_present_in_cert` | whether an `onprem-sid` was found - either the SAN URI or the native ADCS strong-mapping extension |
 | `ad_device_found` / `ad_device_enabled` | on-prem AD lookup result, only populated when `AD_LDAP_ENABLED=true` (see below) - otherwise `false`/`null` |
 | `jamf_serial_present_in_cert` | whether the cert's SAN URIs carried a `jamf-serial` |
 | `jamf_device_found` / `jamf_device_managed` / `jamf_compliant_group_member` / `jamf_last_contact_age_hours` | Jamf Pro lookup result, only populated when `JAMF_ENABLED=true` (see below) - otherwise `false`/`null` |
@@ -205,6 +213,11 @@ SAN URI entry the same way the Intune SCEP profile setup already adds
 | Type | Value |
 |---|---|
 | URI | `urn:example.com:onprem-sid:{{OnPremisesSecurityIdentifier}}` |
+
+If certs come directly from ADCS with strong certificate mapping enabled
+instead, this URI isn't needed at all - ADCS embeds the objectSid natively
+as the `1.3.6.1.4.1.311.25.2` extension, which `extract_identity` reads
+directly (see "Certificate identity convention" above).
 
 This populates `ad_device_found`/`ad_device_enabled` (from AD's
 `userAccountControl` `ACCOUNTDISABLE` bit) but **does not change any

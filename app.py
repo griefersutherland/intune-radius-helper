@@ -33,6 +33,7 @@ import asyncpg
 import httpx
 import ldap3
 import redis.asyncio as redis
+from cryptography import x509
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -650,6 +651,78 @@ def openssl_cert_text(cert_pem: str) -> str:
             pass
 
 
+# ADCS's own strong-mapping mechanism (required since the certifried/
+# CVE-2022-26931 fixes - see KB5014754) embeds the objectSid directly as a
+# certificate extension, rather than a SAN URI of our own invention. A cert
+# issued straight by ADCS with strong mapping enabled will carry this and
+# nothing resembling our onprem-sid URI convention - so this is checked as
+# an alternative source for the same value, not a replacement for the URI
+# path (some deployments may still prefer minting the URI by hand).
+#
+# Extension = 1.3.6.1.4.1.311.25.2 (szOID_NTDS_CA_SECURITY_EXT), DER-encoded
+# per [MS-WCCE] as SEQUENCE { OID szOID_NTDS_OBJECTSID(...25.2.1), OCTET
+# STRING <raw binary SID> }. The SID bytes themselves follow the packet
+# representation in [MS-DTYP] 2.4.2.2: 1-byte revision, 1-byte sub-authority
+# count, 6-byte big-endian identifier-authority, then N x 4-byte
+# little-endian sub-authorities. Verified byte-for-byte against a
+# hand-constructed test certificate before wiring this in, since this feeds
+# directly into an AD authorization decision - not something to get subtly
+# wrong via a hex-scraped regex the way the SAN URIs above are parsed.
+MS_NTDS_SID_EXTENSION_OID = x509.ObjectIdentifier("1.3.6.1.4.1.311.25.2")
+
+
+def _parse_der_length(data: bytes, offset: int) -> tuple[int, int]:
+    """Returns (length, bytes consumed by the length field itself)."""
+    first = data[offset]
+    if first < 0x80:
+        return first, 1
+    num_len_bytes = first & 0x7F
+    length = int.from_bytes(data[offset + 1:offset + 1 + num_len_bytes], "big")
+    return length, 1 + num_len_bytes
+
+
+def _parse_ms_ntds_sid_value(der: bytes) -> str:
+    if der[0] != 0x30:
+        raise ValueError(f"expected SEQUENCE (0x30), got {der[0]:#x}")
+    _, consumed = _parse_der_length(der, 1)
+    pos = 1 + consumed
+
+    if der[pos] != 0x06:
+        raise ValueError(f"expected OID (0x06), got {der[pos]:#x}")
+    oid_len, consumed = _parse_der_length(der, pos + 1)
+    pos += 1 + consumed + oid_len  # OID value itself isn't needed further
+
+    if der[pos] != 0x04:
+        raise ValueError(f"expected OCTET STRING (0x04), got {der[pos]:#x}")
+    os_len, consumed = _parse_der_length(der, pos + 1)
+    pos += 1 + consumed
+    sid_bytes = der[pos:pos + os_len]
+
+    revision = sid_bytes[0]
+    sub_auth_count = sid_bytes[1]
+    identifier_authority = int.from_bytes(sid_bytes[2:8], "big")
+    sub_authorities = [
+        int.from_bytes(sid_bytes[8 + 4 * i:12 + 4 * i], "little")
+        for i in range(sub_auth_count)
+    ]
+    return f"S-{revision}-{identifier_authority}-" + "-".join(str(s) for s in sub_authorities)
+
+
+def extract_ms_ntds_sid(cert_pem: str) -> Optional[str]:
+    try:
+        cert = x509.load_pem_x509_certificate(cert_pem.encode())
+        ext = cert.extensions.get_extension_for_oid(MS_NTDS_SID_EXTENSION_OID)
+        return _parse_ms_ntds_sid_value(ext.value.value)
+    except x509.ExtensionNotFound:
+        return None
+    except Exception:
+        # Malformed/unexpected extension content shouldn't crash the whole
+        # /check request - fail closed on just this field (falls through
+        # to the URI source, or to onprem_sid staying None) rather than
+        # 500ing the entire identity extraction.
+        return None
+
+
 def extract_identity(cert_pem: str) -> dict[str, Any]:
     text = openssl_cert_text(cert_pem)
 
@@ -688,6 +761,9 @@ def extract_identity(cert_pem: str) -> dict[str, Any]:
             onprem_sid = uri[len(onprem_sid_prefix):].strip()
         elif uri.startswith(jamf_serial_prefix):
             jamf_serial = uri[len(jamf_serial_prefix):].strip()
+
+    if onprem_sid is None:
+        onprem_sid = extract_ms_ntds_sid(cert_pem)
 
     return {
         "entra_device_id": entra_device_id,
