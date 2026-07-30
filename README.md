@@ -1,4 +1,4 @@
-# intune-radius-helper
+# mid-radius-helper
 
 > **Note:** This project is written by Claude (Anthropic) and is still a work in progress. Review it accordingly before relying on it.
 
@@ -14,8 +14,11 @@ projects underneath the caching layer - none of this would work, or be
 anywhere near this simple, without their efforts.
 
 A small FastAPI service that lets FreeRADIUS (or any EAP-TLS RADIUS server) gate
-authentication on live Microsoft Intune device compliance and Entra ID account
-status, keyed off identifiers embedded in the client certificate's SAN URIs.
+authentication on live device/identity compliance - Microsoft Intune device
+compliance and Entra ID account status, Jamf Pro Smart Group membership, and/or
+on-prem Active Directory - keyed off identifiers embedded in the client
+certificate's SAN URIs (or, for the AD path, the same objectSid extension ADCS
+strong certificate mapping already embeds natively).
 
 It's a plain HTTP service with no opinion about when it's called - the
 RADIUS server does its own certificate chain/EKU validation, then calls this
@@ -383,11 +386,11 @@ including:
 ## Running
 
 ```
-docker build -t intune-radius-helper .
-docker run --env-file .env -p 8080:8080 intune-radius-helper
+docker build -t mid-radius-helper .
+docker run --env-file .env -p 8080:8080 mid-radius-helper
 ```
 
-Pre-built images are published to `ghcr.io/griefersutherland/intune-radius-helper`.
+Pre-built images are published to `ghcr.io/griefersutherland/mid-radius-helper`.
 
 This service has no opinion about how FreeRADIUS is configured — pair it with
 your own RADIUS `clients.conf` / EAP TLS setup, calling `POST /check` from a

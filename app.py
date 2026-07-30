@@ -1,4 +1,4 @@
-# intune-radius-helper - Intune/Entra device compliance gate for FreeRADIUS EAP-TLS
+# mid-radius-helper - Intune/Jamf/AD device compliance gate for FreeRADIUS EAP-TLS
 # Copyright (C) 2026  griefersutherland
 #
 # This program is free software: you can redistribute it and/or modify
@@ -38,7 +38,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 
-app = FastAPI(title="Intune RADIUS Helper")
+app = FastAPI(title="Mid RADIUS Helper")
 
 
 def env_bool(name: str, default: bool = False) -> bool:
